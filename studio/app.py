@@ -9,7 +9,14 @@ Implements: Requirements 1.4, 2.1, 2.4, 4.2, 8.3, 8.4, 8.5, 8.6, 9.1, 10.1
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
+
+# Ensure the repo root (parent of studio/) is on sys.path so that
+# `import studio.*` works regardless of the working directory.
+_REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
 import gradio as gr
 
