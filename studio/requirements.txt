@@ -10,7 +10,9 @@
 gradio==5.33.0
 
 # --- ML / Inference ---
-torch==2.7.0
+# NOTE: torch is installed separately by the bootstrap script with CUDA index:
+#   uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+# Do NOT include torch here — it will install CPU-only from PyPI.
 diffusers==0.33.1
 transformers==4.52.4
 safetensors==0.5.3

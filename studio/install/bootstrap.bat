@@ -79,6 +79,15 @@ if %ERRORLEVEL% neq 0 (
 
 echo [Cinderworks] Installing pinned dependencies from requirements.txt...
 
+REM Install torch with CUDA support first (requires separate index)
+echo [Cinderworks] Installing PyTorch with CUDA support...
+uv pip install --python "%VENV_DIR%\Scripts\python.exe" torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+if %ERRORLEVEL% neq 0 (
+    echo [Cinderworks] ERROR: Failed to install PyTorch with CUDA.
+    exit /b 1
+)
+
+REM Install remaining dependencies (torch is already satisfied, will be skipped)
 uv pip install --python "%VENV_DIR%\Scripts\python.exe" -r "%REQUIREMENTS%"
 if %ERRORLEVEL% neq 0 (
     echo [Cinderworks] ERROR: Failed to install dependencies.
