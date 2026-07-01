@@ -89,11 +89,31 @@ class VRAMManager:
             )
             self._do_release(self._resident)
 
-        # Check if we can fit the new tenant
-        available = self.estimate_available()
+        # Check if we can fit the new tenant.
+        # After releasing, we use total VRAM as the budget since PyTorch's
+        # allocator may still hold reserved memory that mem_get_info doesn't
+        # report as free. The actual allocation will succeed because the
+        # allocator will reuse that reserved pool.
+        available = self._total_vram
+        log.info(
+            "VRAM check for '%s': needs %s, total VRAM %s, torch free %s",
+            tenant.name,
+            _format_bytes(tenant.estimated_bytes),
+            _format_bytes(self._total_vram),
+            _format_bytes(self._get_torch_free()),
+        )
         if tenant.estimated_bytes > available:
+            log.error(
+                "VRAM insufficient for '%s': needs %s but total is %s",
+                tenant.name,
+                _format_bytes(tenant.estimated_bytes),
+                _format_bytes(available),
+            )
             raise VRAMError(
-                "Not enough VRAM \u2014 try lowering batch size or switching to fp8_scaled precision"
+                f"Not enough VRAM — '{tenant.name}' needs "
+                f"{_format_bytes(tenant.estimated_bytes)} but only "
+                f"{_format_bytes(available)} total. "
+                f"Try lowering batch size or switching to fp8_scaled precision."
             )
 
         # Load the new tenant
@@ -172,7 +192,31 @@ class VRAMManager:
 
             if torch.cuda.is_available():
                 _, total = torch.cuda.mem_get_info()
+                log.info("Detected total VRAM: %s", _format_bytes(total))
                 return total
         except (ImportError, RuntimeError):
             pass
+        log.info("Using default total VRAM: %s", _format_bytes(_DEFAULT_TOTAL_VRAM))
         return _DEFAULT_TOTAL_VRAM
+
+    @staticmethod
+    def _get_torch_free() -> int:
+        """Get torch-reported free VRAM, or -1 if unavailable."""
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                free, _ = torch.cuda.mem_get_info()
+                return free
+        except (ImportError, RuntimeError):
+            pass
+        return -1
+
+
+def _format_bytes(size: int) -> str:
+    """Format bytes as human-readable string."""
+    if size < 0:
+        return "N/A"
+    if size < 1024 * 1024 * 1024:
+        return f"{size / (1024 * 1024):.0f} MB"
+    return f"{size / (1024 * 1024 * 1024):.1f} GB"

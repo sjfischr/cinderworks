@@ -355,3 +355,31 @@ def on_load_params(job_id: int) -> dict[str, Any]:
     except Exception as e:
         log.exception("on_load_params failed")
         return {"error": f"❌ {friendly(e)}"}
+
+
+def on_delete_job(job_id: int) -> str:
+    """Delete a job from history.
+
+    Args:
+        job_id: The database job ID to delete.
+
+    Returns:
+        A status message string.
+    """
+    try:
+        from studio.db import db
+
+        db.init_db()
+
+        if not job_id or job_id <= 0:
+            return "No job selected."
+
+        deleted = db.delete_job(int(job_id))
+        if deleted:
+            return f"✅ Job #{int(job_id)} deleted."
+        else:
+            return f"Job #{int(job_id)} not found."
+
+    except Exception as e:
+        log.exception("on_delete_job failed")
+        return f"❌ {friendly(e)}"

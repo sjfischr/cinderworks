@@ -261,3 +261,23 @@ def get_job_artifacts(job_id: int) -> list[Artifact]:
         ]
     finally:
         conn.close()
+
+
+def delete_job(job_id: int) -> bool:
+    """Delete a job and its artifacts from the database.
+
+    Args:
+        job_id: The job ID to delete.
+
+    Returns:
+        True if the job existed and was deleted, False if not found.
+    """
+    conn = _get_connection()
+    try:
+        # Delete artifacts first (FK constraint)
+        conn.execute("DELETE FROM artifact WHERE job_id = ?", (job_id,))
+        cursor = conn.execute("DELETE FROM job WHERE id = ?", (job_id,))
+        conn.commit()
+        return cursor.rowcount > 0
+    finally:
+        conn.close()

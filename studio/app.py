@@ -198,6 +198,9 @@ def build_app() -> gr.Blocks:
                     load_params_btn = gr.Button(
                         "Load Parameters to Generate Tab", variant="secondary"
                     )
+                    delete_job_btn = gr.Button(
+                        "Delete Job", variant="stop"
+                    )
                     load_params_status = gr.Textbox(
                         label="Status",
                         interactive=False,
@@ -328,6 +331,19 @@ def build_app() -> gr.Blocks:
                 batch_count,
                 load_params_status,
             ],
+        )
+
+        # Delete job: remove from DB and refresh history
+        def _on_delete_job_click(job_id):
+            result = handlers.on_delete_job(int(job_id) if job_id else 0)
+            # Refresh history after deletion
+            rows, _ = _load_history_to_dataframe(0)
+            return result, rows, 0
+
+        delete_job_btn.click(
+            fn=_on_delete_job_click,
+            inputs=[selected_job_id],
+            outputs=[load_params_status, history_display, history_page_state],
         )
 
         # -----------------------------------------------------------------
