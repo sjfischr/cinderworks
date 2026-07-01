@@ -34,13 +34,14 @@ _readiness_state: dict[str, object] = {
 # Expected model files and their minimum sizes (90% of approximate expected)
 # ---------------------------------------------------------------------------
 
-# Model file definitions: (filename, min_bytes)
-# Sizes are 90% of the approximate expected to allow slight variation
+# Model file definitions: (subpath relative to MODEL_DIR, min_bytes)
+# Files are stored in subdirectories matching HF repo structure.
+# Sizes are 90% of the approximate expected to allow slight variation.
 _MODEL_FILES: dict[str, tuple[str, int]] = {
-    "diffusion_fp8": ("krea2_turbo_fp8_scaled.safetensors", int(13e9 * 0.9)),
-    "diffusion_bf16": ("krea2_turbo_bf16.safetensors", int(25e9 * 0.9)),
-    "text_encoder": ("qwen3vl_4b_fp8_scaled.safetensors", int(4e9 * 0.9)),
-    "vae": ("qwen_image_vae.safetensors", int(0.5e9 * 0.9)),
+    "diffusion_fp8": ("diffusion_models/krea2_turbo_fp8_scaled.safetensors", int(13.1e9 * 0.9)),
+    "diffusion_bf16": ("diffusion_models/krea2_turbo_bf16.safetensors", int(26.3e9 * 0.9)),
+    "text_encoder": ("text_encoders/qwen3vl_4b_fp8_scaled.safetensors", int(5.24e9 * 0.9)),
+    "vae": ("vae/qwen_image_vae.safetensors", int(254e6 * 0.9)),
 }
 
 

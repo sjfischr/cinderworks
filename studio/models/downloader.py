@@ -37,13 +37,22 @@ log = logging.getLogger(__name__)
 # The Hugging Face repository holding Krea 2 model files
 _HF_REPO_ID = "Comfy-Org/Krea-2"
 
+# Mapping from local filename → path within the HF repo.
+# Files live in subdirectories on HuggingFace but are stored flat locally.
+_HF_FILE_PATHS: dict[str, str] = {
+    "krea2_turbo_fp8_scaled.safetensors": "diffusion_models/krea2_turbo_fp8_scaled.safetensors",
+    "krea2_turbo_bf16.safetensors": "diffusion_models/krea2_turbo_bf16.safetensors",
+    "qwen3vl_4b_fp8_scaled.safetensors": "text_encoders/qwen3vl_4b_fp8_scaled.safetensors",
+    "qwen_image_vae.safetensors": "vae/qwen_image_vae.safetensors",
+}
+
 # Expected file sizes (bytes) — used for presence validation.
 # A file is considered "present" if its on-disk size >= 90% of expected.
 _EXPECTED_SIZES: dict[str, int] = {
-    "krea2_turbo_fp8_scaled.safetensors": int(13e9),
-    "krea2_turbo_bf16.safetensors": int(25e9),
-    "qwen3vl_4b_fp8_scaled.safetensors": int(4e9),
-    "qwen_image_vae.safetensors": int(0.5e9),
+    "krea2_turbo_fp8_scaled.safetensors": int(13.1e9),
+    "krea2_turbo_bf16.safetensors": int(26.3e9),
+    "qwen3vl_4b_fp8_scaled.safetensors": int(5.24e9),
+    "qwen_image_vae.safetensors": int(254e6),
 }
 
 _SIZE_THRESHOLD = 0.9  # 90% of expected = considered present
@@ -102,7 +111,9 @@ def download_all_models_generator(model_id: str) -> Generator[str, None, None]:
 
     for filename in files_to_download:
         # Check if file is already present and valid
-        filepath = Config.MODEL_DIR / filename
+        # Files from HF are placed in subdirectories matching repo structure
+        hf_path = _HF_FILE_PATHS.get(filename, filename)
+        filepath = Config.MODEL_DIR / hf_path
         expected_size = _EXPECTED_SIZES.get(filename)
 
         if _file_is_present(filepath, expected_size):
@@ -156,7 +167,8 @@ def get_model_info_text(model_id: str) -> str:
 
     for filename in files:
         status = state.get(filename, "unknown")
-        filepath = Config.MODEL_DIR / filename
+        hf_path = _HF_FILE_PATHS.get(filename, filename)
+        filepath = Config.MODEL_DIR / hf_path
         size_str = ""
 
         if filepath.is_file():
@@ -197,7 +209,8 @@ def get_download_state(model_id: str) -> dict[str, str]:
     state: dict[str, str] = {}
 
     for filename in files:
-        filepath = Config.MODEL_DIR / filename
+        hf_path = _HF_FILE_PATHS.get(filename, filename)
+        filepath = Config.MODEL_DIR / hf_path
         expected_size = _EXPECTED_SIZES.get(filename)
 
         if not filepath.is_file():
@@ -372,6 +385,9 @@ def _download_file_with_progress(filename: str) -> Generator[str, None, None]:
 
     error_holder: list[Exception] = []
 
+    # Resolve the HF repo path for this file
+    hf_path = _HF_FILE_PATHS.get(filename, filename)
+
     def _do_download():
         try:
             from huggingface_hub import hf_hub_download
@@ -380,7 +396,7 @@ def _download_file_with_progress(filename: str) -> Generator[str, None, None]:
 
             hf_hub_download(
                 repo_id=_HF_REPO_ID,
-                filename=filename,
+                filename=hf_path,
                 local_dir=str(Config.MODEL_DIR),
                 resume_download=True,
                 local_dir_use_symlinks=False,
