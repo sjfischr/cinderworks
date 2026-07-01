@@ -18,7 +18,7 @@ A local-first image generation studio with a Gradio web UI. Phase 1 ships the co
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| Python | 3.11.x | Not 3.12+ (torch pinned to 3.11-compatible build) |
+| Python | 3.11+ | 3.11, 3.12, or 3.13 all work |
 | Git | any | For cloning |
 | uv | any | Python package installer — [install guide](https://docs.astral.sh/uv/getting-started/installation/) |
 | NVIDIA GPU | 24 GB VRAM recommended | RTX 4090, 3090, etc. fp8_scaled works with ~13 GB |

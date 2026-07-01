@@ -24,17 +24,20 @@ REQUIREMENTS="$STUDIO_ROOT/requirements.txt"
 #  Prerequisite checks — all must pass before any environment work
 # ==============================================================================
 
-# --- Check Python 3.11 ---
+# --- Check Python >= 3.11 ---
 if ! command -v python3 &>/dev/null; then
-    echo "[Cinderworks] ERROR: Missing prerequisite: Python 3.11"
-    echo "[Cinderworks] Please install Python 3.11 and try again."
+    echo "[Cinderworks] ERROR: Missing prerequisite: Python 3.11+"
+    echo "[Cinderworks] Please install Python 3.11 or newer and try again."
     exit 1
 fi
 
-PY_VERSION="$(python3 --version 2>&1)"
-if [[ "$PY_VERSION" != *"3.11"* ]]; then
-    echo "[Cinderworks] ERROR: Missing prerequisite: Python 3.11 (found: $PY_VERSION)"
-    echo "[Cinderworks] Please install Python 3.11 and try again."
+PY_VERSION="$(python3 --version 2>&1 | awk '{print $2}')"
+PY_MAJOR="${PY_VERSION%%.*}"
+PY_MINOR="${PY_VERSION#*.}"; PY_MINOR="${PY_MINOR%%.*}"
+
+if [ "$PY_MAJOR" -lt 3 ] || { [ "$PY_MAJOR" -eq 3 ] && [ "$PY_MINOR" -lt 11 ]; }; then
+    echo "[Cinderworks] ERROR: Missing prerequisite: Python 3.11+ (found: $PY_VERSION)"
+    echo "[Cinderworks] Please install Python 3.11 or newer and try again."
     exit 1
 fi
 

@@ -29,17 +29,24 @@ REM ============================================================================
 
 set "MISSING="
 
-REM --- Check Python 3.11 ---
+REM --- Check Python >= 3.11 ---
 where python >nul 2>&1
 if %ERRORLEVEL% neq 0 (
-    set "MISSING=Python 3.11"
+    set "MISSING=Python 3.11+"
     goto :report_missing
 )
 
-for /f "tokens=*" %%v in ('python --version 2^>^&1') do set "PY_VERSION=%%v"
-echo !PY_VERSION! | findstr /C:"3.11" >nul 2>&1
-if %ERRORLEVEL% neq 0 (
-    set "MISSING=Python 3.11 (found: !PY_VERSION!)"
+for /f "tokens=2 delims= " %%a in ('python --version 2^>^&1') do set "PY_VERSION=%%a"
+for /f "tokens=1,2 delims=." %%x in ("!PY_VERSION!") do (
+    set "PY_MAJOR=%%x"
+    set "PY_MINOR=%%y"
+)
+if !PY_MAJOR! LSS 3 (
+    set "MISSING=Python 3.11+ (found: !PY_VERSION!)"
+    goto :report_missing
+)
+if !PY_MAJOR! EQU 3 if !PY_MINOR! LSS 11 (
+    set "MISSING=Python 3.11+ (found: !PY_VERSION!)"
     goto :report_missing
 )
 
