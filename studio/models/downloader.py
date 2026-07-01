@@ -392,8 +392,6 @@ def _download_file_with_progress(filename: str) -> Generator[str, None, None]:
         try:
             from huggingface_hub import hf_hub_download
 
-            tqdm_cls = _make_tqdm_factory(progress_queue, filename)
-
             progress_queue.put(f"[DEBUG] Calling hf_hub_download(repo_id='{_HF_REPO_ID}', filename='{hf_path}', local_dir='{Config.MODEL_DIR}')")
 
             hf_hub_download(
@@ -402,7 +400,6 @@ def _download_file_with_progress(filename: str) -> Generator[str, None, None]:
                 local_dir=str(Config.MODEL_DIR),
                 resume_download=True,
                 local_dir_use_symlinks=False,
-                tqdm_class=tqdm_cls,
             )
             progress_queue.put(_DOWNLOAD_DONE)
         except Exception as e:
@@ -417,17 +414,29 @@ def _download_file_with_progress(filename: str) -> Generator[str, None, None]:
     thread = threading.Thread(target=_do_download, daemon=True)
     thread.start()
 
+    # Resolve expected size for progress reporting
+    expected_size = _EXPECTED_SIZES.get(filename)
+    hf_path_resolved = _HF_FILE_PATHS.get(filename, filename)
+    local_file = Config.MODEL_DIR / hf_path_resolved
+
     # Yield progress messages from the queue until done
     while True:
         try:
-            msg = progress_queue.get(timeout=1.0)
+            msg = progress_queue.get(timeout=2.0)
         except queue.Empty:
-            # No message yet — check if thread is still alive
+            # No message yet — report file size progress if file exists
             if not thread.is_alive():
-                # Thread died without signaling — check for error
                 if error_holder:
                     raise RuntimeError(str(error_holder[0]))
                 break
+            # Poll file size for progress
+            if local_file.exists() and expected_size:
+                current_size = local_file.stat().st_size
+                pct = min(int((current_size / expected_size) * 100), 99)
+                progress_queue.put(
+                    f"Downloading {filename}: {pct}% "
+                    f"({_format_bytes(current_size)}/{_format_bytes(expected_size)})"
+                )
             continue
 
         if msg is _DOWNLOAD_DONE:
