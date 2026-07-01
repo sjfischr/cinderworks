@@ -19,7 +19,7 @@ safetensors==0.5.3
 accelerate==1.7.0
 
 # --- Model Hub ---
-huggingface_hub==0.32.4
+huggingface_hub[hf_xet]==0.32.4
 
 # --- Config ---
 python-dotenv==1.1.0
