@@ -1,0 +1,27 @@
+# Cinderworks Phase 1 — Exact-pinned dependencies
+# "Still works tomorrow" = no surprise upgrades.
+#
+# Install torch with CUDA: pip install torch --index-url https://download.pytorch.org/whl/cu128
+# Or with uv: uv pip install torch --index-url https://download.pytorch.org/whl/cu128
+#
+# Target: Python 3.11, Windows (RTX 4090) / Linux
+
+# --- Core UI ---
+gradio==5.33.0
+
+# --- ML / Inference ---
+torch==2.7.0
+diffusers==0.33.1
+transformers==4.52.4
+safetensors==0.5.3
+accelerate==1.7.0
+
+# --- Model Hub ---
+huggingface_hub==0.32.4
+
+# --- Config ---
+python-dotenv==1.1.0
+
+# --- Testing ---
+hypothesis==6.131.18
+pytest==8.4.1

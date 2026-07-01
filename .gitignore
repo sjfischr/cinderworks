@@ -1,0 +1,52 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Hypothesis test database
+.hypothesis/
+
+# Pytest cache
+.pytest_cache/
+
+# Model weights (large binary files — download via app)
+studio/models_store/*
+!studio/models_store/.gitkeep
+
+# Generated images
+studio/outputs/*
+!studio/outputs/.gitkeep
+
+# SQLite database (runtime state)
+studio/studio.db
+*.db
+
+# Log files
+studio/cinderworks.log
+*.log
+
+# Environment config (secrets/local paths)
+studio/.env
+!studio/.env.example
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
