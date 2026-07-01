@@ -137,4 +137,4 @@ All tests run without a GPU — model operations are mocked.
 
 ## License
 
-Private / proprietary. All rights reserved.
+MIT — see [LICENSE](LICENSE) for details.
