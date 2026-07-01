@@ -29,7 +29,7 @@ A local-first image generation studio with a Gradio web UI. Phase 1 ships the co
 ### Windows
 
 ```cmd
-git clone <your-repo-url> cinderworks
+git clone https://github.com/sjfischr/cinderworks.git
 cd cinderworks\studio
 install\bootstrap.bat
 ```
@@ -39,7 +39,7 @@ The script creates a local `.venv`, installs exact-pinned dependencies, and laun
 ### Linux
 
 ```bash
-git clone <your-repo-url> cinderworks
+git clone https://github.com/sjfischr/cinderworks.git
 cd cinderworks/studio
 chmod +x install/bootstrap.sh
 ./install/bootstrap.sh
