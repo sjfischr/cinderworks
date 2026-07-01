@@ -245,30 +245,39 @@ def on_download(model_id: str = "krea2-turbo") -> Generator[str, None, None]:
     On completion, re-evaluates readiness so the banner updates.
     Never raises — all exceptions are caught and returned as plain text.
 
+    Accumulates all messages into a running log so the UI shows the full
+    history of what happened (not just the last message).
+
     Args:
         model_id: The registry model ID to download.
 
     Yields:
-        Progress strings per chunk and final status.
+        Accumulated progress log (all messages joined by newlines).
     """
+    lines: list[str] = []
+
     try:
         from studio.models import downloader
         from studio.core import system_check
 
-        yield "Starting model download..."
+        lines.append("Starting model download...")
+        yield "\n".join(lines)
 
         for progress in downloader.download_all_models_generator(model_id):
-            yield progress
+            lines.append(progress)
+            yield "\n".join(lines)
 
         # Re-evaluate readiness after download
         system_check.check_cuda_status()
         banner = system_check.get_readiness_banner()
         if not banner.get("visible", True):
-            yield "✅ System is now ready to generate!"
+            lines.append("✅ System is now ready to generate!")
+            yield "\n".join(lines)
 
     except Exception as e:
         log.exception("on_download failed")
-        yield f"❌ {friendly(e)}"
+        lines.append(f"❌ {friendly(e)}")
+        yield "\n".join(lines)
 
 
 def on_load_history(page: int = 0) -> list[dict[str, Any]]:
