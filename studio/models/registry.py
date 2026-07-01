@@ -55,7 +55,7 @@ _REGISTRY: list[RegistryEntry] = [
         sampler_defaults={"steps": 8, "cfg": 1.0, "mu_shift": 1.15},
         precision_options=["bf16", "fp8_scaled"],
         vram_tiers={
-            "bf16": 25_000_000_000,
+            "bf16": 23_500_000_000,
             "fp8_scaled": 13_000_000_000,
         },
     ),

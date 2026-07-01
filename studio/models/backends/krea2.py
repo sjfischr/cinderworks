@@ -44,7 +44,7 @@ ENCODER_LAYERS = 12
 TEXT_ENCODER_BYTES = 4_000_000_000  # ~4 GB (fp8_scaled)
 VAE_BYTES = 500_000_000  # ~0.5 GB
 DIT_VRAM_TIERS = {
-    "bf16": 25_000_000_000,  # ~25 GB
+    "bf16": 23_500_000_000,  # ~23.5 GB actual GPU footprint (file is 26.3 GB on disk)
     "fp8_scaled": 13_000_000_000,  # ~13 GB
 }
 

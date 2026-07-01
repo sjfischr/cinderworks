@@ -94,25 +94,29 @@ class VRAMManager:
         # allocator may still hold reserved memory that mem_get_info doesn't
         # report as free. The actual allocation will succeed because the
         # allocator will reuse that reserved pool.
-        available = self._total_vram
+        # We allow up to 95% of total VRAM to account for estimation imprecision.
+        available = int(self._total_vram * 0.95)
         log.info(
-            "VRAM check for '%s': needs %s, total VRAM %s, torch free %s",
+            "VRAM check for '%s': needs %s, total VRAM %s (budget %s), torch free %s",
             tenant.name,
             _format_bytes(tenant.estimated_bytes),
             _format_bytes(self._total_vram),
+            _format_bytes(available),
             _format_bytes(self._get_torch_free()),
         )
         if tenant.estimated_bytes > available:
             log.error(
-                "VRAM insufficient for '%s': needs %s but total is %s",
+                "VRAM insufficient for '%s': needs %s but budget is %s (total %s)",
                 tenant.name,
                 _format_bytes(tenant.estimated_bytes),
                 _format_bytes(available),
+                _format_bytes(self._total_vram),
             )
             raise VRAMError(
                 f"Not enough VRAM — '{tenant.name}' needs "
                 f"{_format_bytes(tenant.estimated_bytes)} but only "
-                f"{_format_bytes(available)} total. "
+                f"{_format_bytes(available)} available (card total: "
+                f"{_format_bytes(self._total_vram)}). "
                 f"Try lowering batch size or switching to fp8_scaled precision."
             )
 
