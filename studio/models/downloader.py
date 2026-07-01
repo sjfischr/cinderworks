@@ -131,7 +131,7 @@ def download_all_models_generator(model_id: str) -> Generator[str, None, None]:
         except Exception as e:
             reason = str(e)
             failed.append((filename, reason))
-            log.error("Failed to download %s: %s", filename, reason)
+            log.error("Failed to download %s: %s", filename, reason, exc_info=True)
             yield f"❌ {filename}: download failed — {reason}"
 
     # Summary
@@ -394,6 +394,8 @@ def _download_file_with_progress(filename: str) -> Generator[str, None, None]:
 
             tqdm_cls = _make_tqdm_factory(progress_queue, filename)
 
+            progress_queue.put(f"[DEBUG] Calling hf_hub_download(repo_id='{_HF_REPO_ID}', filename='{hf_path}', local_dir='{Config.MODEL_DIR}')")
+
             hf_hub_download(
                 repo_id=_HF_REPO_ID,
                 filename=hf_path,
@@ -404,6 +406,10 @@ def _download_file_with_progress(filename: str) -> Generator[str, None, None]:
             )
             progress_queue.put(_DOWNLOAD_DONE)
         except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            log.error("Download thread error for %s: %s\n%s", filename, e, tb)
+            progress_queue.put(f"[ERROR] {filename}: {type(e).__name__}: {e}")
             error_holder.append(e)
             progress_queue.put(_DOWNLOAD_ERROR)
 
