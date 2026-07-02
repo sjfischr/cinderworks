@@ -158,6 +158,10 @@ def build_app() -> gr.Blocks:
                         prompt_box = controls.create_prompt_controls()
                         steps, seed, width, height = controls.create_sampler_controls()
                         precision = controls.create_precision_picker()
+                        precision_warning = gr.Markdown(
+                            value="",
+                            elem_id="precision-warning",
+                        )
                         batch_size, batch_count = controls.create_batch_controls()
                         generate_btn = gr.Button(
                             "Generate", variant="primary", size="lg"
@@ -263,6 +267,14 @@ def build_app() -> gr.Blocks:
                 batch_count,
             ],
             outputs=[progress_output, image_gallery],
+        )
+
+        # Precision picker -> advisory VRAM warning (hard refusal still
+        # happens at generate time; this warns before the click)
+        precision.change(
+            fn=handlers.on_precision_change,
+            inputs=[precision],
+            outputs=[precision_warning],
         )
 
         # Check Status button -> refresh model status display

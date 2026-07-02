@@ -347,7 +347,7 @@ def on_load_params(job_id: int) -> dict[str, Any]:
             "steps": params.get("steps", 8),
             "width": params.get("width", 1024),
             "height": params.get("height", 1024),
-            "precision": params.get("precision", "bf16"),
+            "precision": params.get("precision", "fp8_scaled"),
             "batch_size": params.get("batch_size", 1),
             "batch_count": params.get("batch_count", 1),
         }
@@ -355,6 +355,56 @@ def on_load_params(job_id: int) -> dict[str, Any]:
     except Exception as e:
         log.exception("on_load_params failed")
         return {"error": f"❌ {friendly(e)}"}
+
+
+def on_precision_change(precision: str) -> str:
+    """Return an advisory warning when the selected precision won't fit VRAM.
+
+    Called on precision picker change. Compares the registry's VRAM tier
+    estimate for the selected precision against the VRAMManager's usable
+    budget. Returns a plain-language warning string, or an empty string
+    when the selection fits. Purely advisory — the hard refusal still
+    happens at generate time (R6.4/R7.5); this just tells the owner
+    BEFORE they click that the click will be refused.
+
+    Args:
+        precision: The newly selected precision ('bf16' or 'fp8_scaled').
+
+    Returns:
+        Warning markdown string, or "" if the selection fits.
+    """
+    try:
+        from studio.core.vram_manager import VRAMManager
+        from studio.models import registry
+
+        meta = registry.get_meta("krea2-turbo")
+        tier_bytes = meta.vram_tiers.get(precision)
+        if tier_bytes is None:
+            return ""
+
+        vram_mgr = VRAMManager()
+        if vram_mgr.can_fit(tier_bytes):
+            return ""
+
+        usable_gb = vram_mgr.estimate_available() / 1e9
+        needed_gb = tier_bytes / 1e9
+        fitting = [
+            p for p, b in meta.vram_tiers.items() if vram_mgr.can_fit(b)
+        ]
+        suggestion = (
+            f" Choose {' or '.join(fitting)} instead."
+            if fitting
+            else " No precision option fits this card."
+        )
+        return (
+            f"⚠️ {precision} needs about {needed_gb:.0f} GB of VRAM but only "
+            f"~{usable_gb:.0f} GB is usable on this card. Generation will be "
+            f"refused.{suggestion}"
+        )
+    except Exception:
+        log.exception("precision change check failed")
+        # Advisory only — never block the UI over a failed check
+        return ""
 
 
 def on_delete_job(job_id: int) -> str:

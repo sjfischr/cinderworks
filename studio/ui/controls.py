@@ -33,8 +33,8 @@ HEIGHT_MIN, HEIGHT_MAX = 512, 2048
 HEIGHT_DEFAULT = 1024
 SIZE_MULTIPLE = 64
 
-PRECISION_OPTIONS = ["bf16", "fp8_scaled"]
-PRECISION_DEFAULT = "bf16"
+PRECISION_OPTIONS = ["fp8_scaled", "bf16"]
+PRECISION_DEFAULT = "fp8_scaled"
 
 BATCH_SIZE_MIN, BATCH_SIZE_MAX = 1, 16
 BATCH_SIZE_DEFAULT = 1
@@ -109,13 +109,15 @@ def create_sampler_controls() -> tuple[gr.Slider, gr.Number, gr.Slider, gr.Slide
 def create_precision_picker() -> gr.Radio:
     """Create the precision picker control.
 
-    Options: bf16 (full quality, more VRAM) or fp8_scaled (lower VRAM, slight quality trade-off).
+    Options: fp8_scaled (default — fits 24 GB cards) or bf16 (full quality,
+    needs a card with more than 25 GB of usable VRAM).
     """
     return gr.Radio(
         choices=PRECISION_OPTIONS,
         value=PRECISION_DEFAULT,
         label="Precision",
-        info="bf16 = full quality (~25 GB VRAM). fp8_scaled = reduced VRAM (~13 GB) with minimal quality loss.",
+        info="fp8_scaled = ~13 GB VRAM, minimal quality loss (default). "
+        "bf16 = full quality but ~25 GB VRAM — does not fit 24 GB cards.",
     )
 
 

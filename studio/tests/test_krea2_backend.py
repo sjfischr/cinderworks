@@ -647,7 +647,7 @@ class TestTurboDefaultsApplied:
 
         assert result.width == 1024
         assert result.height == 1024
-        assert result.precision == "bf16"
+        assert result.precision == "fp8_scaled"
         assert result.batch_size == 1
         assert result.batch_count == 1
         assert result.seed is None

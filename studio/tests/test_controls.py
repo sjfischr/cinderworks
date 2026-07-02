@@ -59,7 +59,7 @@ class TestValidateUIParamsValid:
         assert result["seed"] is None  # -1 → None (random)
         assert result["width"] == 1024
         assert result["height"] == 1024
-        assert result["precision"] == "bf16"
+        assert result["precision"] == "fp8_scaled"
         assert result["batch_size"] == 1
         assert result["batch_count"] == 1
 
@@ -432,8 +432,8 @@ class TestConstants:
         assert SIZE_MULTIPLE == 64
 
     def test_precision_options(self):
-        assert PRECISION_OPTIONS == ["bf16", "fp8_scaled"]
-        assert PRECISION_DEFAULT == "bf16"
+        assert PRECISION_OPTIONS == ["fp8_scaled", "bf16"]
+        assert PRECISION_DEFAULT == "fp8_scaled"
 
     def test_batch_bounds(self):
         assert BATCH_SIZE_MIN == 1

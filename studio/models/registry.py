@@ -55,7 +55,10 @@ _REGISTRY: list[RegistryEntry] = [
         sampler_defaults={"steps": 8, "cfg": 0.0, "mu_shift": 1.15},
         precision_options=["bf16", "fp8_scaled"],
         vram_tiers={
-            "bf16": 23_500_000_000,
+            # Keep in sync with DIT_VRAM_TIERS in backends/krea2.py.
+            # bf16 transformer weights are 24.76 GiB — does not fit a
+            # 24 GB card once the WDDM reserve is accounted for.
+            "bf16": 25_000_000_000,
             "fp8_scaled": 13_000_000_000,
         },
     ),
