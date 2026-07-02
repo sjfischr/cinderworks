@@ -257,6 +257,29 @@ def estimate_activation_bytes(width: int, height: int, batch_size: int) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _dump_thread_stacks(reason: str) -> None:
+    """Write all-thread Python stack traces to a file and the log.
+
+    The decisive diagnostic for a silent stall: the worker thread's
+    stack names the exact diffusers/torch frame it is sitting in
+    (a .to() copy, an attention kernel, a casting hook, a lock).
+    """
+    try:
+        import faulthandler
+
+        from studio.config import Config
+
+        diag_dir = Config.OUTPUT_DIR / "diagnostics"
+        diag_dir.mkdir(parents=True, exist_ok=True)
+        dump_path = diag_dir / f"stacks_{int(time.time())}.txt"
+        with open(dump_path, "w", encoding="utf-8") as f:
+            faulthandler.dump_traceback(file=f, all_threads=True)
+        stacks = dump_path.read_text(encoding="utf-8")
+        log.warning("%s — all-thread stack dump (%s):\n%s", reason, dump_path, stacks)
+    except Exception:
+        log.exception("Thread stack dump failed")
+
+
 def _log_vram_snapshot(tag: str) -> None:
     """Log a point-in-time CUDA memory snapshot under a tag.
 
@@ -416,6 +439,18 @@ def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False
             _HF_MODEL_ID,
         )
         source = _HF_MODEL_ID
+
+    try:
+        log.info(
+            "Environment: torch %s | cuda %s | %s (sm_%d%d) | diffusers %s",
+            torch.__version__,
+            torch.version.cuda,
+            torch.cuda.get_device_name(0),
+            *torch.cuda.get_device_capability(0),
+            __import__("diffusers").__version__,
+        )
+    except Exception:
+        pass
 
     pipe = Krea2Pipeline.from_pretrained(
         source,
@@ -839,6 +874,11 @@ def _generate_real(
         def _worker() -> None:
             try:
                 step_clock["last"] = time.perf_counter()
+                log.info(
+                    "Worker entering pipeline call (batch %d/%d)",
+                    batch_num + 1,
+                    gen_params.batch_count,
+                )
                 # prompt_embeds instead of prompt: the pipeline skips its
                 # internal text-encoder forward (the encoder is parked on
                 # CPU by now) and duplicates the embeds to batch_size via
@@ -865,8 +905,36 @@ def _generate_real(
         worker = threading.Thread(target=_worker, daemon=True)
         worker.start()
 
+        # Watchdog: turbo steps on a resident fp8 transformer should be
+        # sub-second. If NOTHING arrives for 30s, the worker is stalled
+        # inside a torch/diffusers call — dump every thread's stack so
+        # the log names the exact frame instead of us guessing.
+        _WATCHDOG_TIMEOUT_S = 30.0
+        _MAX_STACK_DUMPS = 3
+        stall_dumps = 0
+        stalled_seconds = 0.0
         while True:
-            msg = progress_q.get()
+            try:
+                msg = progress_q.get(timeout=_WATCHDOG_TIMEOUT_S)
+            except queue.Empty:
+                if not worker.is_alive():
+                    # Worker died without posting _DONE (shouldn't happen
+                    # — the finally block posts it — but never spin).
+                    log.error("Sampling worker died without completing")
+                    break
+                stalled_seconds += _WATCHDOG_TIMEOUT_S
+                if stall_dumps < _MAX_STACK_DUMPS:
+                    stall_dumps += 1
+                    _dump_thread_stacks(
+                        f"No sampling progress for {stalled_seconds:.0f}s "
+                        f"(batch {batch_num + 1})"
+                    )
+                yield (
+                    f"⚠️ Sampling stalled — {stalled_seconds:.0f}s without "
+                    f"completing a step (diagnostic stack dump in log)"
+                )
+                continue
+            stalled_seconds = 0.0
             if msg is _DONE:
                 break
             yield msg
