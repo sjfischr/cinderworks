@@ -13,7 +13,8 @@ gradio==5.33.0
 # NOTE: torch is installed separately by the bootstrap script with CUDA index:
 #   uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
 # Do NOT include torch here — it will install CPU-only from PyPI.
-diffusers>=0.38.0
+# Krea2Pipeline is on diffusers main branch (not yet in a stable release).
+diffusers @ git+https://github.com/huggingface/diffusers.git@main
 transformers>=4.52.0
 safetensors>=0.8.0
 accelerate>=1.7.0
