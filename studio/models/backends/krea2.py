@@ -398,6 +398,64 @@ def _log_component_memory(pipe: Any) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Attention dispatch patch — GQA + mask vs torch fused kernels
+# ---------------------------------------------------------------------------
+
+
+def _patch_krea2_gqa_attention() -> None:
+    """Expand KV heads to match Q heads in Krea2's attention dispatch.
+
+    Krea2 uses grouped-query attention: 48 query heads sharing 12 KV
+    heads, plus a text attention mask. On torch 2.7 no fused SDPA
+    backend accepts that combination — flash rejects arbitrary masks,
+    mem-efficient rejects GQA — so stock SDPA silently falls back to
+    MATH, which materializes the fp32 attention matrix (48 heads x
+    4608^2 x 4 bytes ~= 4 GB per call, 28 blocks per step). Observed in
+    the field: dedicated VRAM filled to the ceiling, WDDM demoted weight
+    pages to shared system memory, and sampling crawled indefinitely.
+
+    The remedy is the one torch's own rejection message suggests:
+    repeat_interleave KV from 12 to 48 heads before the kernel (~57 MB
+    at 1024x1024 — noise) so the mask-compatible mem-efficient kernel
+    engages. repeat_interleave matches GQA semantics (each KV head
+    serves a consecutive group of query heads).
+
+    Patches the dispatch_attention_fn binding inside the Krea2
+    transformer module only — no other model's attention is touched.
+    Idempotent. Layout note: the Krea2 processor hands (B, S, H, D)
+    tensors to dispatch, so heads live on dim 2.
+    """
+    from diffusers.models.transformers import transformer_krea2 as _tk
+
+    if getattr(_tk, "_cinderworks_gqa_patched", False):
+        return
+
+    _orig_dispatch = _tk.dispatch_attention_fn
+
+    def _gqa_expanding_dispatch(query, key, value, *args, **kwargs):
+        if (
+            query.ndim == 4
+            and key.ndim == 4
+            and query.shape[2] != key.shape[2]
+            and key.shape[2] != 0
+            and query.shape[2] % key.shape[2] == 0
+        ):
+            repeat = query.shape[2] // key.shape[2]
+            key = key.repeat_interleave(repeat, dim=2)
+            value = value.repeat_interleave(repeat, dim=2)
+            # Heads now match — GQA handling in the kernel is moot
+            kwargs["enable_gqa"] = False
+        return _orig_dispatch(query, key, value, *args, **kwargs)
+
+    _tk.dispatch_attention_fn = _gqa_expanding_dispatch
+    _tk._cinderworks_gqa_patched = True
+    log.info(
+        "Patched Krea2 attention dispatch: KV heads expanded to match "
+        "query heads (GQA + mask is unsupported by torch fused kernels)"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pipeline Loading (lazy, cached)
 # ---------------------------------------------------------------------------
 
@@ -493,6 +551,8 @@ def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False
         )
     except Exception:
         pass
+
+    _patch_krea2_gqa_attention()
 
     pipe = Krea2Pipeline.from_pretrained(
         source,
