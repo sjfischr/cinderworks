@@ -9,8 +9,17 @@ Implements: Requirements 1.4, 2.1, 2.4, 4.2, 8.3, 8.4, 8.5, 8.6, 9.1, 10.1
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
+
+# Configure the CUDA caching allocator BEFORE anything imports torch.
+# expandable_segments avoids the repeated cudaMalloc/cudaFree churn that
+# per-block transient allocations (layerwise fp8 upcasts, attention
+# buffers) otherwise cause — on Windows/WDDM each raw cudaMalloc can
+# stall on driver paging. Respects an existing user-set value; torch
+# ignores the option with a warning on platforms that don't support it.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 # Ensure the repo root (parent of studio/) is on sys.path so that
 # `import studio.*` works regardless of the working directory.

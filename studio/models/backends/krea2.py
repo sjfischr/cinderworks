@@ -276,8 +276,43 @@ def _dump_thread_stacks(reason: str) -> None:
             faulthandler.dump_traceback(file=f, all_threads=True)
         stacks = dump_path.read_text(encoding="utf-8")
         log.warning("%s — all-thread stack dump (%s):\n%s", reason, dump_path, stacks)
+        _log_gpu_activity()
     except Exception:
         log.exception("Thread stack dump failed")
+
+
+def _log_gpu_activity() -> None:
+    """Log instantaneous GPU utilization via nvidia-smi.
+
+    Distinguishes the two stall modes a Python stack cannot: kernels
+    executing glacially (GPU util high — WDDM paging / slow path) vs a
+    true wedge (GPU util ~0% — deadlocked sync). Best-effort; missing
+    nvidia-smi is logged and ignored.
+    """
+    try:
+        import subprocess
+
+        result = subprocess.run(
+            [
+                "nvidia-smi",
+                "--query-gpu=utilization.gpu,utilization.memory,"
+                "memory.used,memory.total,power.draw,pstate,temperature.gpu",
+                "--format=csv,noheader",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0:
+            log.warning(
+                "GPU activity [util.gpu, util.mem, mem.used, mem.total, "
+                "power, pstate, temp]: %s",
+                result.stdout.strip(),
+            )
+        else:
+            log.info("nvidia-smi query failed: %s", result.stderr.strip())
+    except Exception as exc:
+        log.info("nvidia-smi unavailable: %s", exc)
 
 
 def _log_vram_snapshot(tag: str) -> None:
