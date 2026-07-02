@@ -41,6 +41,15 @@ class Tenant:
 # Default total VRAM fallback when CUDA is not available (24 GB, RTX 4090)
 _DEFAULT_TOTAL_VRAM = 24 * 1024 * 1024 * 1024  # 24 GiB
 
+# Reserve subtracted from total VRAM when computing usable capacity.
+# On Windows/WDDM, the desktop compositor, browser, and driver reserve
+# ~1-1.5 GB of dedicated VRAM. A tenant estimate that exceeds usable
+# (not total) capacity will spill into shared system memory via WDDM
+# sysmem fallback — the GPU shows high utilization while the copy engine
+# thrashes weights over PCIe and generation slows to a crawl. Refusing
+# up front (R6.4, R7.5) is the honest failure mode.
+_VRAM_RESERVE = 1_500_000_000  # ~1.5 GB
+
 
 class VRAMManager:
     """Central coordinator for all GPU memory allocation.
@@ -89,46 +98,40 @@ class VRAMManager:
             )
             self._do_release(self._resident)
 
-        # Check if we can fit the new tenant.
-        # After releasing, we use total VRAM as the budget since PyTorch's
-        # allocator may still hold reserved memory that mem_get_info doesn't
-        # report as free. The actual allocation will succeed because the
-        # allocator will reuse that reserved pool.
-        # We only refuse if the estimate exceeds total VRAM entirely (clearly won't fit).
-        available = self._total_vram
+        # Check if we can fit the new tenant against the usable budget.
+        # self._total_vram IS the usable budget: an explicitly passed value
+        # is taken at face value, and auto-detection already subtracts the
+        # WDDM/desktop reserve (see _detect_total_vram). After releasing
+        # the prior resident, PyTorch's allocator may still hold reserved
+        # memory that mem_get_info doesn't report as free, so we budget
+        # against capacity rather than instantaneous free memory.
+        #
+        # There is deliberately NO grace band above the budget. An
+        # over-capacity load doesn't OOM on Windows; it silently spills
+        # into shared system memory via WDDM sysmem fallback and thrashes
+        # the copy engine. Refusal here is the protective behavior
+        # (R6.4, R7.5).
+        usable = self._total_vram
         log.info(
-            "VRAM check for '%s': needs %s, total VRAM %s, torch free %s",
+            "VRAM check for '%s': needs %s, usable VRAM budget %s, torch free %s",
             tenant.name,
             _format_bytes(tenant.estimated_bytes),
-            _format_bytes(self._total_vram),
+            _format_bytes(usable),
             _format_bytes(self._get_torch_free()),
         )
-        if tenant.estimated_bytes > available:
-            # Estimate exceeds card capacity — warn but still attempt if close
-            headroom_pct = tenant.estimated_bytes / available
-            if headroom_pct > 1.1:
-                # More than 10% over — refuse
-                log.error(
-                    "VRAM insufficient for '%s': needs %s but total is %s (%.0f%% over)",
-                    tenant.name,
-                    _format_bytes(tenant.estimated_bytes),
-                    _format_bytes(available),
-                    (headroom_pct - 1) * 100,
-                )
-                raise VRAMError(
-                    f"Not enough VRAM — '{tenant.name}' needs "
-                    f"{_format_bytes(tenant.estimated_bytes)} but card has "
-                    f"{_format_bytes(available)} total. "
-                    f"Try lowering batch size or switching to fp8_scaled precision."
-                )
-            else:
-                # Within 10% — attempt anyway (estimates are imprecise)
-                log.warning(
-                    "VRAM tight for '%s': needs %s, card has %s. Attempting anyway.",
-                    tenant.name,
-                    _format_bytes(tenant.estimated_bytes),
-                    _format_bytes(available),
-                )
+        if tenant.estimated_bytes > usable:
+            log.error(
+                "VRAM insufficient for '%s': needs %s but usable budget is %s",
+                tenant.name,
+                _format_bytes(tenant.estimated_bytes),
+                _format_bytes(usable),
+            )
+            raise VRAMError(
+                f"Not enough VRAM — '{tenant.name}' needs "
+                f"{_format_bytes(tenant.estimated_bytes)} but only "
+                f"{_format_bytes(usable)} is usable on this card. "
+                f"Try lowering batch size or switching to fp8_scaled precision."
+            )
 
         # Load the new tenant
         log.info(
@@ -200,18 +203,30 @@ class VRAMManager:
 
     @staticmethod
     def _detect_total_vram() -> int:
-        """Detect total VRAM via torch.cuda, or fall back to default."""
+        """Detect the usable VRAM budget via torch.cuda, or fall back.
+
+        Auto-detected capacity has the WDDM/desktop reserve subtracted:
+        raw card capacity is never fully spendable on a machine driving a
+        display. An explicitly passed total_vram (tests, callers with
+        their own accounting) bypasses this and is taken at face value.
+        """
         try:
             import torch
 
             if torch.cuda.is_available():
                 _, total = torch.cuda.mem_get_info()
-                log.info("Detected total VRAM: %s", _format_bytes(total))
-                return total
+                usable = total - _VRAM_RESERVE
+                log.info(
+                    "Detected total VRAM: %s (usable budget %s after reserve)",
+                    _format_bytes(total),
+                    _format_bytes(usable),
+                )
+                return usable
         except (ImportError, RuntimeError):
             pass
-        log.info("Using default total VRAM: %s", _format_bytes(_DEFAULT_TOTAL_VRAM))
-        return _DEFAULT_TOTAL_VRAM
+        usable = _DEFAULT_TOTAL_VRAM - _VRAM_RESERVE
+        log.info("Using default usable VRAM budget: %s", _format_bytes(usable))
+        return usable
 
     @staticmethod
     def _get_torch_free() -> int:

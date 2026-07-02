@@ -13,7 +13,9 @@ This module is importable without torch/CUDA (lazy imports inside functions).
 from __future__ import annotations
 
 import logging
+import queue
 import random
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generator
@@ -41,12 +43,21 @@ BATCH_COUNT_MIN, BATCH_COUNT_MAX = 1, 100
 # Hidden-state layers used for text encoding (12 selected layers)
 ENCODER_LAYERS = 12
 
-# VRAM estimates (bytes) — used for pre-checks and tenant registration
-TEXT_ENCODER_BYTES = 4_000_000_000  # ~4 GB (fp8_scaled)
+# VRAM estimates (bytes) — used for pre-checks and tenant registration.
+# The diffusers-format repo ships the Qwen3-VL-4B text encoder in bf16
+# (~8.5 GB), unlike the Comfy-Org fp8_scaled single file (~5 GB).
+TEXT_ENCODER_BYTES = 8_500_000_000  # ~8.5 GB (bf16, diffusers format)
 VAE_BYTES = 500_000_000  # ~0.5 GB
 DIT_VRAM_TIERS = {
-    "bf16": 23_500_000_000,  # ~23.5 GB actual GPU footprint (file is 26.3 GB on disk)
-    "fp8_scaled": 13_000_000_000,  # ~13 GB
+    # bf16 transformer weights are 24.76 GiB (~26.6 GB decimal) — this
+    # does NOT fit on a 24 GB card once the WDDM reserve and activations
+    # are accounted for. The vram_manager will refuse it there, which is
+    # the honest failure mode (the alternative is sysmem-fallback thrash).
+    "bf16": 25_000_000_000,
+    # fp8_scaled uses layerwise casting: weights stored float8_e4m3fn
+    # (~12.4 GB), upcast to bf16 per-layer for compute. Norm/modulation
+    # layers stay bf16 (diffusers skips them by default for quality).
+    "fp8_scaled": 13_000_000_000,
 }
 
 # HuggingFace model ID for Krea 2 Turbo (diffusers format)
@@ -74,7 +85,7 @@ class GenerationParams:
     mu_shift: float = TURBO_MU_SHIFT
     width: int = 1024
     height: int = 1024
-    precision: str = "bf16"
+    precision: str = "fp8_scaled"
     batch_size: int = 1
     batch_count: int = 1
     seed: int | None = None  # None = generate random
@@ -142,7 +153,7 @@ def validate_params(params: dict[str, Any]) -> GenerationParams:
             f"Height must be a multiple of {SIZE_MULTIPLE}, got {height}"
         )
 
-    precision = params.get("precision", "bf16")
+    precision = params.get("precision", "fp8_scaled")
     if precision not in ("bf16", "fp8_scaled"):
         raise ValueError(
             f"Precision must be 'bf16' or 'fp8_scaled', got '{precision}'"
@@ -204,19 +215,33 @@ def resolve_seed(seed: int | None) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _get_pipeline() -> Any:
-    """Get or load the Krea2Pipeline (lazy singleton).
+def _get_pipeline(precision: str = "fp8_scaled") -> Any:
+    """Get or load the Krea2Pipeline at the requested precision (lazy, cached).
 
     On first call, loads from a local directory if available, otherwise
-    falls back to downloading from HuggingFace. Subsequent calls return
-    the cached pipeline immediately.
+    falls back to downloading from HuggingFace. Subsequent calls with the
+    same precision return the cached pipeline immediately. The cache is
+    keyed by precision so switching bf16 <-> fp8_scaled reloads correctly.
 
     Local path priority:
     1. Config.MODEL_DIR / "krea2-turbo-diffusers" (pre-downloaded via `hf download`)
     2. HuggingFace hub auto-download from "krea/Krea-2-Turbo"
 
-    The pipeline uses model_cpu_offload for memory efficiency — components
-    are moved to GPU only when needed and back to CPU after.
+    Precision handling:
+    - bf16: weights kept in bfloat16 (24.76 GiB transformer — does not fit
+      a 24 GB card; the vram_manager pre-flight refuses it there).
+    - fp8_scaled: layerwise casting on the transformer — weights stored as
+      float8_e4m3fn (~12.4 GB) and upcast to bf16 per layer during compute.
+      Diffusers skips norm/modulation layers automatically (quality-critical).
+      Works directly from the bf16 weights on disk; no separate download.
+
+    VRAM discipline: enable_model_cpu_offload keeps at most one pipeline
+    component GPU-resident at a time (encode -> offload encoder ->
+    load transformer -> sample -> offload -> load VAE -> decode). With the
+    fp8-cast transformer at ~12.4 GB, every component fits a 24 GB card
+    with headroom, so no WDDM sysmem spill occurs. Top-level residency is
+    still accounted through vram_manager tenants (the app-wide ledger that
+    Phase 3/4 tenants will share).
 
     Returns:
         A loaded Krea2Pipeline instance ready for inference.
@@ -224,8 +249,18 @@ def _get_pipeline() -> Any:
     Raises:
         RuntimeError: If the pipeline cannot be loaded.
     """
-    if "pipe" in _pipeline_cache:
-        return _pipeline_cache["pipe"]
+    cache_key = f"pipe:{precision}"
+    if cache_key in _pipeline_cache:
+        return _pipeline_cache[cache_key]
+
+    # Evict a pipeline loaded at a different precision so we don't hold
+    # two full weight sets in system RAM.
+    for stale_key in [k for k in _pipeline_cache if k.startswith("pipe:")]:
+        log.info("Evicting cached pipeline '%s' (precision change)", stale_key)
+        del _pipeline_cache[stale_key]
+    import gc
+
+    gc.collect()
 
     import torch
     from diffusers import Krea2Pipeline
@@ -237,7 +272,10 @@ def _get_pipeline() -> Any:
         log.info("Loading Krea2Pipeline from local path: %s", local_path)
         source = str(local_path)
     else:
-        log.info("Loading Krea2Pipeline from '%s' (first use — this may download ~36 GB)", _HF_MODEL_ID)
+        log.info(
+            "Loading Krea2Pipeline from '%s' (first use — this may download ~36 GB)",
+            _HF_MODEL_ID,
+        )
         source = _HF_MODEL_ID
 
     pipe = Krea2Pipeline.from_pretrained(
@@ -245,14 +283,26 @@ def _get_pipeline() -> Any:
         torch_dtype=torch.bfloat16,
     )
 
-    # Use model_cpu_offload for VRAM efficiency: each component is moved
-    # to GPU only during its forward pass, then back to CPU. This respects
-    # the load→encode→offload→load→sample→decode principle without manual
-    # tenant management of pipeline internals.
+    if precision == "fp8_scaled":
+        log.info(
+            "Applying layerwise fp8 casting to transformer "
+            "(storage=float8_e4m3fn, compute=bfloat16)"
+        )
+        pipe.transformer.enable_layerwise_casting(
+            storage_dtype=torch.float8_e4m3fn,
+            compute_dtype=torch.bfloat16,
+        )
+
+    # One pipeline component GPU-resident at a time; the rest wait in
+    # system RAM. This is what makes the encode->offload->sample->decode
+    # sequence hold at the accelerate-hook level.
     pipe.enable_model_cpu_offload()
 
-    log.info("Krea2Pipeline loaded successfully with model_cpu_offload enabled")
-    _pipeline_cache["pipe"] = pipe
+    log.info(
+        "Krea2Pipeline loaded (precision=%s) with model_cpu_offload enabled",
+        precision,
+    )
+    _pipeline_cache[cache_key] = pipe
     return pipe
 
 
@@ -341,35 +391,35 @@ def _generate_real(
     import torch
     from studio.core.vram_manager import Tenant
 
-    # Register a single "pipeline" tenant for top-level VRAM coordination.
-    # The pipeline handles its own internal component offloading.
+    dit_bytes = DIT_VRAM_TIERS.get(gen_params.precision, DIT_VRAM_TIERS["fp8_scaled"])
+
+    # --- Pre-flight VRAM check BEFORE any weights move -----------------
+    # The peak GPU-resident component under model_cpu_offload is the
+    # transformer at the chosen precision. If it won't fit usable VRAM,
+    # refuse now with a plain-language message (R6.4/R7.5) rather than
+    # letting the Windows driver spill weights into shared system memory
+    # and thrash the copy engine for an hour.
+    #
+    # The tenant sequence below (text_encoder -> release -> dit) mirrors
+    # the physical encode->offload->sample order that the accelerate
+    # cpu_offload hooks enforce inside the pipeline, and keeps the
+    # app-wide VRAM ledger accurate for Phase 3/4 tenants.
     pipeline_ref: dict[str, Any] = {"pipe": None}
 
-    dit_bytes = DIT_VRAM_TIERS.get(gen_params.precision, DIT_VRAM_TIERS["bf16"])
-
     def _load_pipeline() -> None:
-        pipeline_ref["pipe"] = _get_pipeline()
+        pipeline_ref["pipe"] = _get_pipeline(gen_params.precision)
 
     def _unload_pipeline() -> None:
-        # Pipeline stays cached but we signal we're done with GPU
+        # Pipeline stays cached in system RAM; cpu_offload hooks have
+        # already returned components to CPU. Nothing to move here.
         pass
 
-    pipeline_tenant = Tenant(
-        name="text_encoder",  # Use text_encoder name first for compatibility
+    text_encoder_tenant = Tenant(
+        name="text_encoder",
         estimated_bytes=TEXT_ENCODER_BYTES,
         load_fn=_load_pipeline,
         unload_fn=_unload_pipeline,
     )
-
-    # Acquire to register our GPU usage
-    vram_mgr.acquire(pipeline_tenant)
-
-    yield "Loading pipeline..."
-    pipe = _get_pipeline()
-
-    # Release the "text_encoder" tenant and acquire "dit" tenant
-    # This maintains the expected acquire/release sequence that tests verify
-    vram_mgr.release(pipeline_tenant)
 
     dit_tenant = Tenant(
         name="dit",
@@ -377,6 +427,25 @@ def _generate_real(
         load_fn=lambda: None,
         unload_fn=lambda: None,
     )
+
+    # Check the DiT fits BEFORE paying for the pipeline load. This is the
+    # gate that turns "bf16 on a 24 GB card" into an instant, honest
+    # refusal instead of a silent sysmem-fallback tar pit.
+    if not vram_mgr.can_fit(dit_bytes):
+        from studio.core.vram_manager import VRAMError
+
+        raise VRAMError(
+            f"Not enough VRAM for {gen_params.precision} precision — the "
+            f"diffusion model needs about {dit_bytes / 1e9:.0f} GB. "
+            f"Switch to fp8_scaled precision, which fits this card."
+        )
+
+    vram_mgr.acquire(text_encoder_tenant)
+
+    yield "Loading pipeline..."
+    pipe = _get_pipeline(gen_params.precision)
+
+    vram_mgr.release(text_encoder_tenant)
     vram_mgr.acquire(dit_tenant)
 
     # --- Generation loop ---
@@ -385,6 +454,9 @@ def _generate_real(
     image_index = 0
 
     from studio.config import Config
+
+    # Sentinel for the progress queue
+    _DONE = object()
 
     for batch_num in range(gen_params.batch_count):
         yield f"Encoding prompt... (batch {batch_num + 1}/{gen_params.batch_count})"
@@ -397,29 +469,55 @@ def _generate_real(
             for i in range(gen_params.batch_size)
         ]
 
-        # Progress callback for step updates
-        def _step_callback(pipe_self: Any, step: int, timestep: Any, callback_kwargs: dict) -> dict:
-            # We can't yield from inside a callback, so we log instead
-            log.info("Sampling step %d/%d", step + 1, gen_params.steps)
+        # --- Live progress: run the pipeline in a worker thread and ---
+        # --- stream step updates through a queue (same pattern as   ---
+        # --- the downloader). The Gradio generator drains the queue ---
+        # --- so the UI shows real forward movement per step (R5.8). ---
+        progress_q: queue.Queue = queue.Queue()
+        outcome: dict[str, Any] = {}
+
+        def _step_callback(
+            pipe_self: Any, step: int, timestep: Any, callback_kwargs: dict
+        ) -> dict:
+            progress_q.put(
+                f"Sampling step {step + 1}/{gen_params.steps} "
+                f"(batch {batch_num + 1}/{gen_params.batch_count})"
+            )
             return callback_kwargs
 
-        yield f"Sampling... (batch {batch_num + 1}/{gen_params.batch_count})"
+        def _worker() -> None:
+            try:
+                outcome["result"] = pipe(
+                    prompt=gen_params.prompt,
+                    height=gen_params.height,
+                    width=gen_params.width,
+                    num_inference_steps=gen_params.steps,
+                    guidance_scale=gen_params.cfg,
+                    num_images_per_prompt=gen_params.batch_size,
+                    generator=generators if len(generators) > 1 else generators[0],
+                    callback_on_step_end=_step_callback,
+                )
+            except Exception as exc:  # noqa: BLE001 — re-raised on main thread
+                outcome["error"] = exc
+            finally:
+                progress_q.put(_DONE)
 
-        # Run the pipeline
-        result = pipe(
-            prompt=gen_params.prompt,
-            height=gen_params.height,
-            width=gen_params.width,
-            num_inference_steps=gen_params.steps,
-            guidance_scale=gen_params.cfg,
-            num_images_per_prompt=gen_params.batch_size,
-            generator=generators if len(generators) > 1 else generators[0],
-            callback_on_step_end=_step_callback,
-        )
+        worker = threading.Thread(target=_worker, daemon=True)
+        worker.start()
 
-        # Yield step progress messages
-        for step in range(gen_params.steps):
-            yield f"Sampling step {step + 1}/{gen_params.steps}"
+        while True:
+            msg = progress_q.get()
+            if msg is _DONE:
+                break
+            yield msg
+
+        worker.join()
+        if "error" in outcome:
+            # Surface on the main thread so the handler error boundary
+            # catches it and maps it to a plain-language message.
+            raise outcome["error"]
+
+        result = outcome["result"]
 
         yield f"Decoding... (batch {batch_num + 1}/{gen_params.batch_count})"
 
@@ -519,7 +617,7 @@ def _generate_stub(
 
         dit_tenant = Tenant(
             name="dit",
-            estimated_bytes=DIT_VRAM_TIERS.get(gen_params.precision, DIT_VRAM_TIERS["bf16"]),
+            estimated_bytes=DIT_VRAM_TIERS.get(gen_params.precision, DIT_VRAM_TIERS["fp8_scaled"]),
             load_fn=_load_dit_model,
             unload_fn=_unload_dit_model,
         )
