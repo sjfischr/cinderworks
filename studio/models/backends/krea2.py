@@ -44,9 +44,15 @@ BATCH_COUNT_MIN, BATCH_COUNT_MAX = 1, 100
 ENCODER_LAYERS = 12
 
 # VRAM estimates (bytes) — used for pre-checks and tenant registration.
-# The diffusers-format repo ships the Qwen3-VL-4B text encoder in bf16
-# (~8.5 GB), unlike the Comfy-Org fp8_scaled single file (~5 GB).
-TEXT_ENCODER_BYTES = 8_500_000_000  # ~8.5 GB (bf16, diffusers format)
+# The diffusers-format repo ships the Qwen3-VL-4B text encoder in bf16;
+# at fp8_scaled precision we apply layerwise fp8 casting to it (same
+# technique as the transformer), matching the ~5 GB footprint of the
+# Comfy-Org fp8_scaled single file that the ComfyUI ecosystem treats as
+# the standard way to run this encoder.
+TEXT_ENCODER_VRAM_TIERS = {
+    "bf16": 8_500_000_000,  # ~8.5 GB (bf16, diffusers format)
+    "fp8_scaled": 4_800_000_000,  # ~4.8 GB (fp8 storage, norm/embed kept bf16)
+}
 VAE_BYTES = 500_000_000  # ~0.5 GB
 DIT_VRAM_TIERS = {
     # bf16 transformer weights are 24.76 GiB (~26.6 GB decimal) — this
@@ -59,6 +65,20 @@ DIT_VRAM_TIERS = {
     # layers stay bf16 (diffusers skips them by default for quality).
     "fp8_scaled": 13_000_000_000,
 }
+
+# Activation/intermediate-buffer estimate for the transformer forward pass
+# (attention + MLP intermediates, SDPA scratch, latent/hidden-state
+# tensors). This is on top of the static weight footprint in
+# DIT_VRAM_TIERS above and scales with resolution and batch_size — it's
+# the part of VRAM usage that a fixed per-precision constant misses, and
+# the reason a generation can still spill even when the weights alone
+# fit. Baseline is a conservative estimate at 1024x1024/batch_size=1;
+# not profiled against the real model, so it deliberately rounds up
+# rather than down (an over-estimate causes an early, honest refusal;
+# an under-estimate causes the silent WDDM spill this module exists to
+# prevent).
+_ACTIVATION_BASELINE_BYTES = 2_000_000_000  # ~2 GB at 1024x1024, batch_size=1
+_ACTIVATION_REFERENCE_PIXELS = 1024 * 1024
 
 # HuggingFace model ID for Krea 2 Turbo (diffusers format)
 _HF_MODEL_ID = "krea/Krea-2-Turbo"
@@ -210,18 +230,41 @@ def resolve_seed(seed: int | None) -> int:
     return random.randint(SEED_MIN, SEED_MAX)
 
 
+def estimate_activation_bytes(width: int, height: int, batch_size: int) -> int:
+    """Estimate transformer activation/intermediate-buffer VRAM (bytes).
+
+    Scales linearly with pixel count (sequence length grows with the
+    latent's spatial size) and with batch_size (each item in a batch
+    gets its own activation buffers, run simultaneously). See
+    _ACTIVATION_BASELINE_BYTES for why this is a conservative estimate
+    rather than a profiled figure.
+
+    Args:
+        width: Output image width in pixels.
+        height: Output image height in pixels.
+        batch_size: Number of images generated simultaneously.
+
+    Returns:
+        Estimated activation VRAM footprint in bytes.
+    """
+    pixel_ratio = (width * height) / _ACTIVATION_REFERENCE_PIXELS
+    return int(_ACTIVATION_BASELINE_BYTES * pixel_ratio * batch_size)
+
+
 # ---------------------------------------------------------------------------
 # Pipeline Loading (lazy, cached)
 # ---------------------------------------------------------------------------
 
 
-def _get_pipeline(precision: str = "fp8_scaled") -> Any:
+def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False) -> Any:
     """Get or load the Krea2Pipeline at the requested precision (lazy, cached).
 
     On first call, loads from a local directory if available, otherwise
     falls back to downloading from HuggingFace. Subsequent calls with the
-    same precision return the cached pipeline immediately. The cache is
-    keyed by precision so switching bf16 <-> fp8_scaled reloads correctly.
+    same precision and residency mode return the cached pipeline
+    immediately. The cache is keyed by (precision, mode) so switching
+    bf16 <-> fp8_scaled, or crossing the full-GPU-fit threshold, reloads
+    correctly.
 
     Local path priority:
     1. Config.MODEL_DIR / "krea2-turbo-diffusers" (pre-downloaded via `hf download`)
@@ -230,18 +273,25 @@ def _get_pipeline(precision: str = "fp8_scaled") -> Any:
     Precision handling:
     - bf16: weights kept in bfloat16 (24.76 GiB transformer — does not fit
       a 24 GB card; the vram_manager pre-flight refuses it there).
-    - fp8_scaled: layerwise casting on the transformer — weights stored as
-      float8_e4m3fn (~12.4 GB) and upcast to bf16 per layer during compute.
-      Diffusers skips norm/modulation layers automatically (quality-critical).
-      Works directly from the bf16 weights on disk; no separate download.
+    - fp8_scaled: layerwise casting on the transformer AND text encoder —
+      weights stored as float8_e4m3fn (transformer ~12.4 GB, encoder
+      ~4.8 GB) and upcast to bf16 per layer during compute. Norm layers
+      (and the encoder's embedding table) stay bf16 for quality. Works
+      directly from the bf16 weights on disk; no separate download.
 
-    VRAM discipline: enable_model_cpu_offload keeps at most one pipeline
-    component GPU-resident at a time (encode -> offload encoder ->
-    load transformer -> sample -> offload -> load VAE -> decode). With the
-    fp8-cast transformer at ~12.4 GB, every component fits a 24 GB card
-    with headroom, so no WDDM sysmem spill occurs. Top-level residency is
-    still accounted through vram_manager tenants (the app-wide ledger that
-    Phase 3/4 tenants will share).
+    Residency mode (full_gpu_resident):
+    - True: caller has already checked the *combined* footprint (text
+      encoder + transformer + VAE) fits the usable VRAM budget. The whole
+      pipeline is moved to the GPU once via `pipe.to("cuda")` and stays
+      there for the duration of generation — no per-component CPU<->PCIe
+      shuttling.
+    - False: the combined footprint doesn't fit, so we fall back to
+      `enable_model_cpu_offload()`, which keeps at most one component
+      GPU-resident at a time (encode -> offload encoder -> load
+      transformer -> sample -> offload -> load VAE -> decode) via
+      accelerate hooks. This is slower (PCIe transfer per component, per
+      call) but is the only way to run a working set that doesn't fit
+      resident all at once.
 
     Returns:
         A loaded Krea2Pipeline instance ready for inference.
@@ -249,14 +299,15 @@ def _get_pipeline(precision: str = "fp8_scaled") -> Any:
     Raises:
         RuntimeError: If the pipeline cannot be loaded.
     """
-    cache_key = f"pipe:{precision}"
+    mode = "gpu" if full_gpu_resident else "offload"
+    cache_key = f"pipe:{precision}:{mode}"
     if cache_key in _pipeline_cache:
         return _pipeline_cache[cache_key]
 
-    # Evict a pipeline loaded at a different precision so we don't hold
-    # two full weight sets in system RAM.
+    # Evict any other cached pipeline so we don't hold two full weight
+    # sets in system RAM (different precision or residency mode).
     for stale_key in [k for k in _pipeline_cache if k.startswith("pipe:")]:
-        log.info("Evicting cached pipeline '%s' (precision change)", stale_key)
+        log.info("Evicting cached pipeline '%s' (precision/mode change)", stale_key)
         del _pipeline_cache[stale_key]
     import gc
 
@@ -293,15 +344,56 @@ def _get_pipeline(precision: str = "fp8_scaled") -> Any:
             compute_dtype=torch.bfloat16,
         )
 
-    # One pipeline component GPU-resident at a time; the rest wait in
-    # system RAM. This is what makes the encode->offload->sample->decode
-    # sequence hold at the accelerate-hook level.
-    pipe.enable_model_cpu_offload()
+        # Also fp8-cast the Qwen3-VL-4B text encoder (~8.5 GB bf16 ->
+        # ~4.8 GB). Running this encoder at fp8 is the ComfyUI ecosystem
+        # standard (qwen3vl_4b_fp8_scaled.safetensors is THE file every
+        # workflow ships). The encoder is a transformers Qwen3VLModel,
+        # not a diffusers ModelMixin, so use the generic hooks utility
+        # rather than enable_layerwise_casting. Norm and embedding
+        # modules stay bf16: norms are quality-critical, and the
+        # embedding table is a lookup whose fp8 savings aren't worth the
+        # precision loss at the very start of the conditioning path.
+        log.info(
+            "Applying layerwise fp8 casting to text encoder "
+            "(storage=float8_e4m3fn, compute=bfloat16, norm/embed kept bf16)"
+        )
+        from diffusers.hooks import apply_layerwise_casting
 
-    log.info(
-        "Krea2Pipeline loaded (precision=%s) with model_cpu_offload enabled",
-        precision,
-    )
+        apply_layerwise_casting(
+            pipe.text_encoder,
+            storage_dtype=torch.float8_e4m3fn,
+            compute_dtype=torch.bfloat16,
+            skip_modules_pattern=("norm", "embed"),
+        )
+
+    # VAE slicing: decode one image at a time so a batch doesn't
+    # multiply the decode-stage activation peak by batch_size. No effect
+    # on single-image batches; guarded because not every VAE class
+    # implements slicing.
+    if hasattr(pipe.vae, "enable_slicing"):
+        pipe.vae.enable_slicing()
+        log.info("VAE slicing enabled (per-image decode)")
+    else:
+        log.warning(
+            "VAE %s does not support slicing — batch decode will peak "
+            "at batch_size x single-image activation cost",
+            type(pipe.vae).__name__,
+        )
+
+    if full_gpu_resident:
+        log.info(
+            "Combined working set fits usable VRAM budget — loading "
+            "pipeline fully GPU-resident (no offload)"
+        )
+        pipe.to("cuda")
+    else:
+        log.info(
+            "Combined working set exceeds usable VRAM budget — using "
+            "model_cpu_offload (components swap CPU<->GPU per call)"
+        )
+        pipe.enable_model_cpu_offload()
+
+    log.info("Krea2Pipeline loaded (precision=%s, mode=%s)", precision, mode)
     _pipeline_cache[cache_key] = pipe
     return pipe
 
@@ -327,9 +419,12 @@ def generate(params: dict[str, Any]) -> Generator[str | dict, None, None]:
     - Progress strings (encoding, sampling steps, decoding)
     - A final dict with images and resolved params
 
-    All GPU moves go through the pipeline's cpu_offload mechanism (which
-    internally handles the encode→offload→sample→decode sequence) and
-    through vram_manager for top-level tenant coordination.
+    When the full working set (text encoder + transformer + VAE) fits the
+    usable VRAM budget, the pipeline loads fully GPU-resident via
+    `pipe.to("cuda")` — no offload traffic. Otherwise GPU moves go through
+    the pipeline's cpu_offload mechanism (which internally handles the
+    encode→offload→sample→decode sequence). Either way, vram_manager
+    handles top-level tenant coordination.
 
     Args:
         params: Raw generation parameters dict.
@@ -392,61 +487,97 @@ def _generate_real(
     from studio.core.vram_manager import Tenant
 
     dit_bytes = DIT_VRAM_TIERS.get(gen_params.precision, DIT_VRAM_TIERS["fp8_scaled"])
+    text_encoder_bytes = TEXT_ENCODER_VRAM_TIERS.get(
+        gen_params.precision, TEXT_ENCODER_VRAM_TIERS["fp8_scaled"]
+    )
+    activation_bytes = estimate_activation_bytes(
+        gen_params.width, gen_params.height, gen_params.batch_size
+    )
+    dit_peak_bytes = dit_bytes + activation_bytes
+    combined_bytes = text_encoder_bytes + dit_peak_bytes + VAE_BYTES
 
     # --- Pre-flight VRAM check BEFORE any weights move -----------------
-    # The peak GPU-resident component under model_cpu_offload is the
-    # transformer at the chosen precision. If it won't fit usable VRAM,
-    # refuse now with a plain-language message (R6.4/R7.5) rather than
-    # letting the Windows driver spill weights into shared system memory
-    # and thrash the copy engine for an hour.
-    #
-    # The tenant sequence below (text_encoder -> release -> dit) mirrors
-    # the physical encode->offload->sample order that the accelerate
-    # cpu_offload hooks enforce inside the pipeline, and keeps the
-    # app-wide VRAM ledger accurate for Phase 3/4 tenants.
-    pipeline_ref: dict[str, Any] = {"pipe": None}
-
-    def _load_pipeline() -> None:
-        pipeline_ref["pipe"] = _get_pipeline(gen_params.precision)
-
-    def _unload_pipeline() -> None:
-        # Pipeline stays cached in system RAM; cpu_offload hooks have
-        # already returned components to CPU. Nothing to move here.
-        pass
-
-    text_encoder_tenant = Tenant(
-        name="text_encoder",
-        estimated_bytes=TEXT_ENCODER_BYTES,
-        load_fn=_load_pipeline,
-        unload_fn=_unload_pipeline,
-    )
-
-    dit_tenant = Tenant(
-        name="dit",
-        estimated_bytes=dit_bytes,
-        load_fn=lambda: None,
-        unload_fn=lambda: None,
-    )
-
-    # Check the DiT fits BEFORE paying for the pipeline load. This is the
-    # gate that turns "bf16 on a 24 GB card" into an instant, honest
-    # refusal instead of a silent sysmem-fallback tar pit.
-    if not vram_mgr.can_fit(dit_bytes):
+    # The peak GPU-resident load under model_cpu_offload is the
+    # transformer weights at the chosen precision PLUS the activation
+    # buffers for the sampling forward pass — the latter scales with
+    # resolution and batch_size (R6.4's per-image-footprint × batch_size
+    # requirement), which a flat weight-only estimate misses. If the
+    # combined peak won't fit usable VRAM, refuse now with a
+    # plain-language message (R6.4/R7.5) rather than letting the Windows
+    # driver spill weights into shared system memory and thrash the copy
+    # engine for an hour.
+    if not vram_mgr.can_fit(dit_peak_bytes):
         from studio.core.vram_manager import VRAMError
 
         raise VRAMError(
-            f"Not enough VRAM for {gen_params.precision} precision — the "
-            f"diffusion model needs about {dit_bytes / 1e9:.0f} GB. "
-            f"Switch to fp8_scaled precision, which fits this card."
+            f"Not enough VRAM for {gen_params.precision} precision at "
+            f"{gen_params.width}x{gen_params.height}, batch size "
+            f"{gen_params.batch_size} — needs about "
+            f"{dit_bytes / 1e9:.0f} GB for the model plus "
+            f"{activation_bytes / 1e9:.1f} GB for sampling buffers. "
+            f"Try a smaller batch size, lower resolution, or fp8_scaled "
+            f"precision."
         )
 
-    vram_mgr.acquire(text_encoder_tenant)
+    # Does the WHOLE working set (text encoder + transformer + VAE +
+    # activation buffers) fit resident together? If so there's no reason
+    # to pay per-component CPU<->GPU offload traffic on every
+    # generation — load once with pipe.to("cuda") and leave it resident.
+    # Only fall back to enable_model_cpu_offload's sequential swap when
+    # the combined footprint genuinely doesn't fit (e.g. a smaller card,
+    # or a large batch/resolution eating the headroom).
+    full_gpu_resident = vram_mgr.can_fit(combined_bytes)
 
-    yield "Loading pipeline..."
-    pipe = _get_pipeline(gen_params.precision)
+    pipeline_ref: dict[str, Any] = {"pipe": None}
 
-    vram_mgr.release(text_encoder_tenant)
-    vram_mgr.acquire(dit_tenant)
+    def _load_pipeline() -> None:
+        pipeline_ref["pipe"] = _get_pipeline(gen_params.precision, full_gpu_resident)
+
+    def _unload_pipeline() -> None:
+        # Pipeline stays cached in system RAM/GPU between calls; nothing
+        # to move here (offload hooks, or the resident .to("cuda") state,
+        # are left as-is for reuse on the next generation).
+        pass
+
+    if full_gpu_resident:
+        # Single tenant sized to the combined footprint — the whole
+        # pipeline stays GPU-resident for the duration of generation, so
+        # there's no text_encoder -> dit handoff to account for.
+        pipeline_tenant = Tenant(
+            name="pipeline",
+            estimated_bytes=combined_bytes,
+            load_fn=_load_pipeline,
+            unload_fn=_unload_pipeline,
+        )
+        vram_mgr.acquire(pipeline_tenant)
+
+        yield "Loading pipeline..."
+        pipe = _get_pipeline(gen_params.precision, full_gpu_resident)
+    else:
+        # Working set doesn't fit resident together — mirror the physical
+        # encode->offload->sample order that the accelerate cpu_offload
+        # hooks enforce inside the pipeline, keeping the app-wide VRAM
+        # ledger accurate for Phase 3/4 tenants.
+        text_encoder_tenant = Tenant(
+            name="text_encoder",
+            estimated_bytes=text_encoder_bytes,
+            load_fn=_load_pipeline,
+            unload_fn=_unload_pipeline,
+        )
+        dit_tenant = Tenant(
+            name="dit",
+            estimated_bytes=dit_peak_bytes,
+            load_fn=lambda: None,
+            unload_fn=lambda: None,
+        )
+
+        vram_mgr.acquire(text_encoder_tenant)
+
+        yield "Loading pipeline..."
+        pipe = _get_pipeline(gen_params.precision, full_gpu_resident)
+
+        vram_mgr.release(text_encoder_tenant)
+        vram_mgr.acquire(dit_tenant)
 
     # --- Generation loop ---
     all_images: list[Path] = []
@@ -532,8 +663,11 @@ def _generate_real(
             all_seeds.append(img_seed)
             image_index += 1
 
-    # Release the dit tenant
-    vram_mgr.release(dit_tenant)
+    # Release whichever tenant is resident
+    if full_gpu_resident:
+        vram_mgr.release(pipeline_tenant)
+    else:
+        vram_mgr.release(dit_tenant)
 
     # --- Final result ---
     yield {
@@ -594,7 +728,9 @@ def _generate_stub(
 
         text_encoder_tenant = Tenant(
             name="text_encoder",
-            estimated_bytes=TEXT_ENCODER_BYTES,
+            estimated_bytes=TEXT_ENCODER_VRAM_TIERS.get(
+                gen_params.precision, TEXT_ENCODER_VRAM_TIERS["fp8_scaled"]
+            ),
             load_fn=_load_encoder,
             unload_fn=_unload_encoder,
         )
