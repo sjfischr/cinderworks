@@ -737,7 +737,13 @@ def generate(params: dict[str, Any]) -> Generator[str | dict, None, None]:
     log.info("Resolved base seed: %d", base_seed)
 
     # --- 3. Get vram_manager instance ---
-    vram_mgr: VRAMManager = params.get("_vram_manager") or VRAMManager()
+    # The app-wide singleton: budget detected once per process, tenant
+    # state persists across generations. A fresh manager per generation
+    # would re-measure the budget with our own resident cache on the
+    # card and mistake it for foreign usage.
+    from studio.core.vram_manager import get_vram_manager
+
+    vram_mgr: VRAMManager = params.get("_vram_manager") or get_vram_manager()
 
     # --- 4. Check if we're in test/mock mode ---
     # If no CUDA is available or _mock_inference is set, use the lightweight
