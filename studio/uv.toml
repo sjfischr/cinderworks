@@ -1,0 +1,17 @@
+# Pins the default package index for `uv pip install` commands run in
+# this project to PyTorch's CUDA 12.8 wheel index, with PyPI as a
+# fallback for everything else.
+#
+# Without this, installing ANY package that depends on torch (spandrel,
+# a future package, etc.) resolves torch from plain PyPI — which has no
+# CUDA build under that name and silently replaces the pinned
+# torch==2.7.0+cu128 with a CPU-only build. That happened for real:
+# `uv pip install spandrel` swapped torch 2.7.0+cu128 -> 2.12.1 (CPU)
+# because no index preference was configured.
+#
+# torch is still deliberately excluded from requirements.txt (see the
+# comment there) — this file is what makes any OTHER uv pip install in
+# this project safe to run without re-breaking that pin.
+[pip]
+index-url = "https://download.pytorch.org/whl/cu128"
+extra-index-url = ["https://pypi.org/simple"]
