@@ -374,7 +374,7 @@ def on_precision_change(precision: str) -> str:
         Warning markdown string, or "" if the selection fits.
     """
     try:
-        from studio.core.vram_manager import VRAMManager
+        from studio.core.vram_manager import get_vram_manager
         from studio.models import registry
 
         meta = registry.get_meta("krea2-turbo")
@@ -382,7 +382,7 @@ def on_precision_change(precision: str) -> str:
         if tier_bytes is None:
             return ""
 
-        vram_mgr = VRAMManager()
+        vram_mgr = get_vram_manager()
         if vram_mgr.can_fit(tier_bytes):
             return ""
 
@@ -407,8 +407,82 @@ def on_precision_change(precision: str) -> str:
         return ""
 
 
+def on_upscale(image_path: str | None, method: str, scale: float) -> tuple[str | None, str]:
+    """Upscale an image with the selected method.
+
+    Args:
+        image_path: Path to the source image (from the image input).
+        method: Display name of the upscale method.
+        scale: Requested scale factor.
+
+    Returns:
+        (output_image_path_or_None, status_message)
+    """
+    try:
+        from studio.models import upscale
+
+        if not image_path:
+            return None, "Choose an image to upscale first."
+
+        out_path = upscale.upscale(image_path, method, float(scale))
+        return str(out_path), f"✅ Upscaled to {out_path.name}"
+
+    except Exception as e:
+        log.exception("on_upscale failed")
+        return None, f"❌ {friendly(e)}"
+
+
+def on_download_upscaler() -> Generator[str, None, None]:
+    """Download the upscaler model, streaming accumulated progress."""
+    lines: list[str] = []
+    try:
+        from studio.models import downloader
+
+        lines.append("Starting upscaler download...")
+        yield "\n".join(lines)
+
+        for progress in downloader.download_upscaler_generator():
+            lines.append(progress)
+            yield "\n".join(lines)
+
+    except Exception as e:
+        log.exception("on_download_upscaler failed")
+        lines.append(f"❌ {friendly(e)}")
+        yield "\n".join(lines)
+
+
+def _delete_job_files(job_id: int) -> int:
+    """Delete a job's artifact image files from disk.
+
+    Deleting only the DB row leaves the PNGs in outputs/ forever — the
+    job "data" the owner wants gone is mostly the images. Removes each
+    artifact file and any output directory left empty. Returns the
+    number of files removed. Never raises.
+    """
+    from studio.db import db
+
+    removed = 0
+    parents: set[Path] = set()
+    for artifact in db.get_job_artifacts(job_id):
+        path = Path(artifact.path)
+        try:
+            if path.is_file():
+                path.unlink()
+                removed += 1
+            parents.add(path.parent)
+        except OSError:
+            log.warning("Could not delete artifact file %s", path)
+    for parent in parents:
+        try:
+            if parent.is_dir() and not any(parent.iterdir()):
+                parent.rmdir()
+        except OSError:
+            pass
+    return removed
+
+
 def on_delete_job(job_id: int) -> str:
-    """Delete a job from history.
+    """Delete a single job from history (DB rows AND image files).
 
     Args:
         job_id: The database job ID to delete.
@@ -416,20 +490,42 @@ def on_delete_job(job_id: int) -> str:
     Returns:
         A status message string.
     """
+    if not job_id or job_id <= 0:
+        return "No job selected."
+    return on_delete_jobs([int(job_id)])
+
+
+def on_delete_jobs(job_ids: list[int]) -> str:
+    """Delete multiple jobs from history, including image files on disk.
+
+    Args:
+        job_ids: Database job IDs to delete.
+
+    Returns:
+        A status message string summarizing what was removed.
+    """
     try:
         from studio.db import db
 
         db.init_db()
 
-        if not job_id or job_id <= 0:
-            return "No job selected."
+        if not job_ids:
+            return "No jobs selected."
 
-        deleted = db.delete_job(int(job_id))
-        if deleted:
-            return f"✅ Job #{int(job_id)} deleted."
-        else:
-            return f"Job #{int(job_id)} not found."
+        deleted = 0
+        files_removed = 0
+        for job_id in job_ids:
+            files_removed += _delete_job_files(int(job_id))
+            if db.delete_job(int(job_id)):
+                deleted += 1
+
+        if deleted == 0:
+            return "No matching jobs found."
+        return (
+            f"✅ Deleted {deleted} job(s) and removed "
+            f"{files_removed} image file(s) from disk."
+        )
 
     except Exception as e:
-        log.exception("on_delete_job failed")
+        log.exception("on_delete_jobs failed")
         return f"❌ {friendly(e)}"

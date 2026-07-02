@@ -211,28 +211,33 @@ class VRAMManager:
     def _detect_total_vram() -> int:
         """Detect the usable VRAM budget via torch.cuda, or fall back.
 
-        The reserve is dynamic: it is whatever other processes (desktop
-        compositor, browser, driver) are actually holding at detection
-        time plus a 1 GB safety margin, floored at the 1.5 GB static
-        estimate. A flat reserve under-budgets on a desktop with a
-        browser open (real usage was already measurable — use it) and
-        the safety margin absorbs growth after detection. An explicitly
-        passed total_vram (tests, callers with their own accounting)
-        bypasses this and is taken at face value.
+        The reserve is dynamic: whatever OTHER processes (desktop
+        compositor, browser, driver) are holding at detection time plus
+        a 1 GB safety margin, floored at the 1.5 GB static estimate.
+        Torch's own reserved pool is explicitly EXCLUDED from the
+        "others" figure — it is our cache (the resident pipeline between
+        generations) and is fully reusable by the next tenant. Counting
+        it as foreign collapsed the budget to ~1 GB on every generation
+        after the first. An explicitly passed total_vram (tests, callers
+        with their own accounting) bypasses this and is taken at face
+        value.
         """
         try:
             import torch
 
             if torch.cuda.is_available():
                 free, total = torch.cuda.mem_get_info()
-                in_use_by_others = total - free
+                ours = torch.cuda.memory_reserved()
+                in_use_by_others = max(0, total - free - ours)
                 reserve = max(_VRAM_RESERVE, in_use_by_others + _VRAM_SAFETY)
                 usable = total - reserve
                 log.info(
-                    "Detected total VRAM: %s (%s already in use by other "
-                    "processes; reserving %s; usable budget %s)",
+                    "Detected total VRAM: %s (%s in use by other processes, "
+                    "%s is our own torch cache; reserving %s; usable "
+                    "budget %s)",
                     _format_bytes(total),
                     _format_bytes(in_use_by_others),
+                    _format_bytes(ours),
                     _format_bytes(reserve),
                     _format_bytes(usable),
                 )
@@ -264,3 +269,28 @@ def _format_bytes(size: int) -> str:
     if size < 1024 * 1024 * 1024:
         return f"{size / (1024 * 1024):.0f} MB"
     return f"{size / (1024 * 1024 * 1024):.1f} GB"
+
+
+# ---------------------------------------------------------------------------
+# App-wide singleton
+# ---------------------------------------------------------------------------
+
+# The design doc names vram_manager THE single GPU chokepoint — that only
+# holds if every generation shares one instance. A fresh instance per
+# generation re-detects the budget mid-session, at which point our own
+# resident cache distorts the numbers and tenant state is forgotten.
+_default_manager: VRAMManager | None = None
+
+
+def get_vram_manager() -> VRAMManager:
+    """Return the shared app-wide VRAMManager, creating it on first use."""
+    global _default_manager
+    if _default_manager is None:
+        _default_manager = VRAMManager()
+    return _default_manager
+
+
+def _reset_vram_manager() -> None:
+    """Drop the shared manager. For testing only."""
+    global _default_manager
+    _default_manager = None

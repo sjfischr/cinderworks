@@ -47,16 +47,23 @@ _HISTORY_DATATYPES = ["number", "str", "number", "number", "str", "str", "str"]
 _IMAGE_PLACEHOLDER = "[image unavailable]"
 
 
-def _load_history_to_dataframe(page: int):
-    """Convert handler output to dataframe rows and increment page.
+def _render_history_page(page: int):
+    """Render one page of history.
 
-    Displays: truncated prompt (120 chars), seed, steps, resolution,
-    precision, and model_id. Returns (rows, next_page).
+    Returns (rows, page, page_label_markdown, checkbox_update) where the
+    checkbox update carries the current page's job IDs as selectable
+    choices for multi-delete.
     """
     jobs = handlers.on_load_history(page=page)
     if jobs and "error" in jobs[0]:
-        return [[jobs[0]["error"], "", "", "", "", "", ""]], page
+        return (
+            [[jobs[0]["error"], "", "", "", "", "", ""]],
+            page,
+            f"Page {page + 1}",
+            gr.update(choices=[], value=[]),
+        )
     rows = []
+    choices = []
     for j in jobs:
         params = j.get("params", {})
         w = params.get("width", "?")
@@ -71,15 +78,31 @@ def _load_history_to_dataframe(page: int):
             params.get("precision", ""),
             j.get("model_id", ""),
         ])
+        choices.append(
+            (f"#{j.get('id')} \u2014 {j.get('prompt', '')[:48]}", str(j.get("id")))
+        )
     if not rows:
         rows = [["", "No jobs found", "", "", "", "", ""]]
-    return rows, page + 1
+    return rows, page, f"Page {page + 1}", gr.update(choices=choices, value=[])
 
 
 def _load_first_page():
     """Load the first page of history (called on tab select)."""
-    rows, _ = _load_history_to_dataframe(0)
-    return rows, 0
+    return _render_history_page(0)
+
+
+def _history_prev_page(page: int):
+    """Go to the previous history page (clamped at the first)."""
+    return _render_history_page(max(0, (page or 0) - 1))
+
+
+def _history_next_page(page: int):
+    """Go to the next history page; stay put if it would be empty."""
+    next_page = (page or 0) + 1
+    jobs = handlers.on_load_history(page=next_page)
+    if not jobs or (jobs and "error" in jobs[0]):
+        return _render_history_page(page or 0)
+    return _render_history_page(next_page)
 
 
 def _on_load_params_click(selected_job_id):
@@ -199,7 +222,20 @@ def build_app() -> gr.Blocks:
                         label="Generation History",
                         interactive=False,
                     )
-                    load_more_btn = gr.Button("Load More", variant="secondary")
+                    with gr.Row():
+                        history_prev_btn = gr.Button("◀ Previous", variant="secondary")
+                        history_page_label = gr.Markdown("Page 1")
+                        history_next_btn = gr.Button("Next ▶", variant="secondary")
+                    gr.Markdown("---")
+                    gr.Markdown("#### Delete Jobs")
+                    history_delete_select = gr.CheckboxGroup(
+                        label="Select jobs to delete (removes database "
+                        "entries AND image files)",
+                        choices=[],
+                    )
+                    delete_selected_btn = gr.Button(
+                        "Delete Selected", variant="stop"
+                    )
                     gr.Markdown("---")
                     gr.Markdown("#### Load Parameters from Job")
                     selected_job_id = gr.Number(
@@ -211,15 +247,50 @@ def build_app() -> gr.Blocks:
                     load_params_btn = gr.Button(
                         "Load Parameters to Generate Tab", variant="secondary"
                     )
-                    delete_job_btn = gr.Button(
-                        "Delete Job", variant="stop"
-                    )
                     load_params_status = gr.Textbox(
                         label="Status",
                         interactive=False,
                         lines=1,
                         placeholder="",
                     )
+
+            # =============================================================
+            # UPSCALE TAB
+            # =============================================================
+            with gr.Tab("Upscale"):
+                from studio.models import upscale as _upscale_mod
+
+                with gr.Row():
+                    with gr.Column():
+                        upscale_input = gr.Image(
+                            label="Image to upscale",
+                            type="filepath",
+                        )
+                        upscale_method = gr.Radio(
+                            choices=_upscale_mod.list_methods(),
+                            value=_upscale_mod.METHOD_LANCZOS,
+                            label="Method",
+                            info="Lanczos needs no model. Real-ESRGAN is "
+                            "sharper but needs a one-time ~67 MB download "
+                            "(Models tab).",
+                        )
+                        upscale_scale = gr.Slider(
+                            minimum=1.0,
+                            maximum=4.0,
+                            value=2.0,
+                            step=0.5,
+                            label="Scale factor",
+                        )
+                        upscale_btn = gr.Button("Upscale", variant="primary")
+                        upscale_status = gr.Textbox(
+                            label="Status", interactive=False, lines=1
+                        )
+                    with gr.Column():
+                        upscale_output = gr.Image(
+                            label="Upscaled result",
+                            type="filepath",
+                            interactive=False,
+                        )
 
             # =============================================================
             # MODELS TAB
@@ -236,6 +307,10 @@ def build_app() -> gr.Blocks:
                     )
                     download_btn = gr.Button(
                         "Download Krea 2 Turbo", variant="primary"
+                    )
+                    download_upscaler_btn = gr.Button(
+                        "Download Upscaler (Real-ESRGAN 4x, ~67 MB)",
+                        variant="secondary",
                     )
                     download_progress = gr.Textbox(
                         label="Download Progress",
@@ -323,18 +398,43 @@ def build_app() -> gr.Blocks:
             outputs=[readiness_banner, model_status_display],
         )
 
+        # Upscaler model download
+        download_upscaler_btn.click(
+            fn=handlers.on_download_upscaler,
+            inputs=[],
+            outputs=[download_progress],
+        )
+
+        # Upscale an image
+        upscale_btn.click(
+            fn=handlers.on_upscale,
+            inputs=[upscale_input, upscale_method, upscale_scale],
+            outputs=[upscale_output, upscale_status],
+        )
+
         # History: auto-load first page when tab is selected
+        _history_outputs = [
+            history_display,
+            history_page_state,
+            history_page_label,
+            history_delete_select,
+        ]
         history_tab.select(
             fn=_load_first_page,
             inputs=[],
-            outputs=[history_display, history_page_state],
+            outputs=_history_outputs,
         )
 
-        # History: load more (next page)
-        load_more_btn.click(
-            fn=_load_history_to_dataframe,
+        # History: page navigation
+        history_prev_btn.click(
+            fn=_history_prev_page,
             inputs=[history_page_state],
-            outputs=[history_display, history_page_state],
+            outputs=_history_outputs,
+        )
+        history_next_btn.click(
+            fn=_history_next_page,
+            inputs=[history_page_state],
+            outputs=_history_outputs,
         )
 
         # Load params: populate Generate tab fields from a past job
@@ -354,17 +454,18 @@ def build_app() -> gr.Blocks:
             ],
         )
 
-        # Delete job: remove from DB and refresh history
-        def _on_delete_job_click(job_id):
-            result = handlers.on_delete_job(int(job_id) if job_id else 0)
-            # Refresh history after deletion
-            rows, _ = _load_history_to_dataframe(0)
-            return result, rows, 0
+        # Delete selected jobs: remove DB rows + image files, re-render page
+        def _on_delete_selected_click(selected_ids, page):
+            result = handlers.on_delete_jobs(
+                [int(s) for s in (selected_ids or [])]
+            )
+            rows, page, label, checkbox = _render_history_page(page or 0)
+            return result, rows, page, label, checkbox
 
-        delete_job_btn.click(
-            fn=_on_delete_job_click,
-            inputs=[selected_job_id],
-            outputs=[load_params_status, history_display, history_page_state],
+        delete_selected_btn.click(
+            fn=_on_delete_selected_click,
+            inputs=[history_delete_select, history_page_state],
+            outputs=[load_params_status, *_history_outputs],
         )
 
         # -----------------------------------------------------------------

@@ -44,6 +44,13 @@ _HF_FILE_PATHS: dict[str, str] = {
     "krea2_turbo_bf16.safetensors": "diffusion_models/krea2_turbo_bf16.safetensors",
     "qwen3vl_4b_fp8_scaled.safetensors": "text_encoders/qwen3vl_4b_fp8_scaled.safetensors",
     "qwen_image_vae.safetensors": "vae/qwen_image_vae.safetensors",
+    "RealESRGAN_x4.pth": "RealESRGAN_x4.pth",
+}
+
+# Per-file HF repo overrides. Files not listed here come from _HF_REPO_ID.
+# Upscaler models live in their own repos.
+_HF_FILE_REPOS: dict[str, str] = {
+    "RealESRGAN_x4.pth": "ai-forever/Real-ESRGAN",
 }
 
 # Expected file sizes (bytes) — used for presence validation.
@@ -53,7 +60,12 @@ _EXPECTED_SIZES: dict[str, int] = {
     "krea2_turbo_bf16.safetensors": int(26.3e9),
     "qwen3vl_4b_fp8_scaled.safetensors": int(5.24e9),
     "qwen_image_vae.safetensors": int(254e6),
+    "RealESRGAN_x4.pth": int(67e6),
 }
+
+# Upscaler model files (not part of any generation model's registry
+# entry — downloaded on demand from the Models tab).
+UPSCALER_FILES: list[str] = ["RealESRGAN_x4.pth"]
 
 _SIZE_THRESHOLD = 0.9  # 90% of expected = considered present
 
@@ -144,6 +156,56 @@ def download_all_models_generator(model_id: str) -> Generator[str, None, None]:
         )
     elif succeeded:
         yield f"✅ All {len(succeeded)} files downloaded successfully."
+
+
+def download_upscaler_generator() -> Generator[str, None, None]:
+    """Download the upscaler model file(s), yielding progress strings.
+
+    Same behavior as download_all_models_generator but for the standalone
+    upscaler files (which live outside any generation model's registry
+    entry, in their own HF repos).
+    """
+    Config.ensure_dirs()
+
+    if not check_huggingface_hub():
+        yield "❌ Cannot reach Hugging Face — check your internet connection and try again."
+        return
+
+    for filename in UPSCALER_FILES:
+        hf_path = _HF_FILE_PATHS.get(filename, filename)
+        filepath = Config.MODEL_DIR / hf_path
+        expected_size = _EXPECTED_SIZES.get(filename)
+
+        if _file_is_present(filepath, expected_size):
+            yield f"{filename}: already downloaded"
+            continue
+
+        yield f"Starting download: {filename}"
+        try:
+            yield from _download_file_with_progress(filename)
+            yield f"✅ {filename}: download complete"
+        except Exception as e:
+            log.error("Failed to download %s: %s", filename, e, exc_info=True)
+            yield f"❌ {filename}: download failed — {e}"
+
+
+def get_upscaler_state() -> dict[str, str]:
+    """Per-file download status for the upscaler files.
+
+    Same status values as get_download_state: present/partial/missing.
+    """
+    state: dict[str, str] = {}
+    for filename in UPSCALER_FILES:
+        hf_path = _HF_FILE_PATHS.get(filename, filename)
+        filepath = Config.MODEL_DIR / hf_path
+        expected_size = _EXPECTED_SIZES.get(filename)
+        if not filepath.is_file():
+            state[filename] = "missing"
+        elif expected_size and filepath.stat().st_size < int(expected_size * _SIZE_THRESHOLD):
+            state[filename] = "partial"
+        else:
+            state[filename] = "present"
+    return state
 
 
 def get_model_info_text(model_id: str) -> str:
@@ -388,14 +450,16 @@ def _download_file_with_progress(filename: str) -> Generator[str, None, None]:
     # Resolve the HF repo path for this file
     hf_path = _HF_FILE_PATHS.get(filename, filename)
 
+    repo_id = _HF_FILE_REPOS.get(filename, _HF_REPO_ID)
+
     def _do_download():
         try:
             from huggingface_hub import hf_hub_download
 
-            progress_queue.put(f"[DEBUG] Calling hf_hub_download(repo_id='{_HF_REPO_ID}', filename='{hf_path}', local_dir='{Config.MODEL_DIR}')")
+            progress_queue.put(f"[DEBUG] Calling hf_hub_download(repo_id='{repo_id}', filename='{hf_path}', local_dir='{Config.MODEL_DIR}')")
 
             hf_hub_download(
-                repo_id=_HF_REPO_ID,
+                repo_id=repo_id,
                 filename=hf_path,
                 local_dir=str(Config.MODEL_DIR),
                 resume_download=True,

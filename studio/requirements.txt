@@ -18,6 +18,8 @@ diffusers @ git+https://github.com/huggingface/diffusers.git@main
 transformers>=4.52.0
 safetensors>=0.8.0
 accelerate>=1.7.0
+# Upscaler model loader (ESRGAN-family, same loader Forge/ComfyUI use)
+spandrel>=0.4.0
 
 # --- Model Hub ---
 huggingface_hub[hf_xet]>=0.34.0
