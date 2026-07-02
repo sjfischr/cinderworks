@@ -467,13 +467,24 @@ def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False
 
     if full_gpu_resident:
         log.info(
-            "Combined working set fits usable VRAM budget — loading "
-            "pipeline fully GPU-resident (no offload)"
+            "Working set fits usable VRAM budget — loading transformer "
+            "and VAE GPU-resident; text encoder parks in system RAM "
+            "between encodes"
         )
         pipe.to("cuda")
+        # The text encoder only runs once per generation (we pre-encode
+        # and pass prompt_embeds to the pipeline), so it does NOT need
+        # to occupy VRAM during the long sampling phase. Park it in
+        # system RAM; the text_encoder tenant moves it up for the encode
+        # and back down after. Telemetry showed that keeping it resident
+        # pushed dedicated VRAM to ~85% occupancy before sampling even
+        # started — on WDDM the driver responds to that pressure by
+        # silently migrating pages to shared system memory.
+        pipe.text_encoder.to("cpu")
+        torch.cuda.empty_cache()
     else:
         log.info(
-            "Combined working set exceeds usable VRAM budget — using "
+            "Working set exceeds usable VRAM budget — using "
             "model_cpu_offload (components swap CPU<->GPU per call)"
         )
         pipe.enable_model_cpu_offload()
@@ -567,8 +578,17 @@ def _generate_real(
 ) -> Generator[str | dict, None, None]:
     """Real inference path using Krea2Pipeline.
 
-    Loads the pipeline on first use, then generates images using the
-    diffusers Krea2Pipeline with proper progress callbacks.
+    Physical flow (resident mode): the transformer+VAE live on the GPU
+    across generations; the text encoder parks in system RAM. Each
+    generation moves the encoder up, encodes the prompt ONCE, moves it
+    back down, then samples every batch from the pre-computed
+    prompt_embeds. This keeps the long sampling phase at minimum VRAM
+    pressure — on WDDM, sustained high occupancy makes the driver
+    silently migrate pages to shared system memory even without an OOM.
+
+    In offload mode the accelerate hooks own component placement; the
+    pre-encoded embeds still mean the text encoder is onloaded once per
+    generation instead of once per batch.
     """
     import torch
     from studio.core.vram_manager import Tenant
@@ -589,18 +609,25 @@ def _generate_real(
         gen_params.width, gen_params.height, gen_params.batch_size
     )
     dit_peak_bytes = dit_bytes + activation_bytes
-    combined_bytes = text_encoder_bytes + dit_peak_bytes + VAE_BYTES
+
+    # Peak VRAM moments in resident mode. The text encoder runs once per
+    # generation (we pre-encode and hand prompt_embeds to the pipeline),
+    # so it never coexists with sampling activations — but during the
+    # brief encode it DOES coexist with the resident transformer+VAE.
+    _ENCODE_OVERHEAD = 500_000_000  # encoder forward activations, ~0.5 GB
+    encode_peak_bytes = dit_bytes + VAE_BYTES + text_encoder_bytes + _ENCODE_OVERHEAD
+    sample_peak_bytes = dit_bytes + VAE_BYTES + activation_bytes
+    resident_peak_bytes = max(encode_peak_bytes, sample_peak_bytes)
 
     # --- Pre-flight VRAM check BEFORE any weights move -----------------
-    # The peak GPU-resident load under model_cpu_offload is the
+    # The irreducible need (even under model_cpu_offload) is the
     # transformer weights at the chosen precision PLUS the activation
     # buffers for the sampling forward pass — the latter scales with
     # resolution and batch_size (R6.4's per-image-footprint × batch_size
-    # requirement), which a flat weight-only estimate misses. If the
-    # combined peak won't fit usable VRAM, refuse now with a
-    # plain-language message (R6.4/R7.5) rather than letting the Windows
-    # driver spill weights into shared system memory and thrash the copy
-    # engine for an hour.
+    # requirement), which a flat weight-only estimate misses. If that
+    # won't fit usable VRAM, refuse now with a plain-language message
+    # (R6.4/R7.5) rather than letting the Windows driver spill weights
+    # into shared system memory and thrash the copy engine for an hour.
     if not vram_mgr.can_fit(dit_peak_bytes):
         from studio.core.vram_manager import VRAMError
 
@@ -614,65 +641,100 @@ def _generate_real(
             f"precision."
         )
 
-    # Does the WHOLE working set (text encoder + transformer + VAE +
-    # activation buffers) fit resident together? If so there's no reason
-    # to pay per-component CPU<->GPU offload traffic on every
-    # generation — load once with pipe.to("cuda") and leave it resident.
-    # Only fall back to enable_model_cpu_offload's sequential swap when
-    # the combined footprint genuinely doesn't fit (e.g. a smaller card,
-    # or a large batch/resolution eating the headroom).
-    full_gpu_resident = vram_mgr.can_fit(combined_bytes)
+    # Keep the transformer+VAE resident when the worst peak moment fits.
+    # The text encoder is shuttled to GPU only for the encode, so the
+    # budget question is max(encode peak, sampling peak), not the sum of
+    # everything at once. Fall back to enable_model_cpu_offload's
+    # sequential swap only when even that doesn't fit.
+    full_gpu_resident = vram_mgr.can_fit(resident_peak_bytes)
+    log.info(
+        "VRAM plan: encode peak %.1f GB, sampling peak %.1f GB, "
+        "resident=%s",
+        encode_peak_bytes / 1e9,
+        sample_peak_bytes / 1e9,
+        full_gpu_resident,
+    )
 
     pipeline_ref: dict[str, Any] = {"pipe": None}
 
-    def _load_pipeline() -> None:
+    def _load_text_encoder() -> None:
+        # First acquire also loads the pipeline itself (lazy).
         pipeline_ref["pipe"] = _get_pipeline(gen_params.precision, full_gpu_resident)
+        if full_gpu_resident:
+            log.info("Moving text encoder to GPU for encode")
+            pipeline_ref["pipe"].text_encoder.to("cuda")
+        # In offload mode the accelerate hooks own placement — nothing to do.
 
-    def _unload_pipeline() -> None:
-        # Pipeline stays cached in system RAM/GPU between calls; nothing
-        # to move here (offload hooks, or the resident .to("cuda") state,
-        # are left as-is for reuse on the next generation).
-        pass
+    def _unload_text_encoder() -> None:
+        if full_gpu_resident and pipeline_ref["pipe"] is not None:
+            log.info("Returning text encoder to system RAM")
+            pipeline_ref["pipe"].text_encoder.to("cpu")
+            # Return the freed blocks to the driver, not just to torch's
+            # caching allocator — WDDM pressure is measured by the
+            # driver, and reserved-but-unused pages still count.
+            torch.cuda.empty_cache()
+
+    text_encoder_tenant = Tenant(
+        name="text_encoder",
+        estimated_bytes=text_encoder_bytes,
+        load_fn=_load_text_encoder,
+        unload_fn=_unload_text_encoder,
+    )
+    # The transformer+VAE stay physically resident across generations in
+    # resident mode (that's the point of the cache); the tenant exists so
+    # the app-wide ledger reflects who owns the GPU during sampling.
+    dit_tenant = Tenant(
+        name="dit",
+        estimated_bytes=dit_peak_bytes,
+        load_fn=lambda: None,
+        unload_fn=lambda: None,
+    )
+
+    # --- Encode ONCE per generation ------------------------------------
+    # The prompt is identical for every batch; only seeds differ. Encoding
+    # up front means the text encoder does exactly one GPU round-trip per
+    # generation instead of one per batch, and the pipeline call skips
+    # its internal text-encoder forward entirely when given prompt_embeds.
+    vram_mgr.acquire(text_encoder_tenant)
+
+    yield "Loading pipeline..."
+    pipe = _get_pipeline(gen_params.precision, full_gpu_resident)
+
+    yield "Encoding prompt..."
+    encode_device = torch.device("cuda") if full_gpu_resident else None
+    with torch.inference_mode():
+        prompt_embeds, prompt_embeds_mask = pipe.encode_prompt(
+            prompt=gen_params.prompt,
+            device=encode_device,
+            num_images_per_prompt=1,  # __call__ duplicates to batch_size
+        )
+        negative_embeds = None
+        negative_embeds_mask = None
+        if gen_params.cfg and gen_params.cfg > 1.0:
+            negative_embeds, negative_embeds_mask = pipe.encode_prompt(
+                prompt="",
+                device=encode_device,
+                num_images_per_prompt=1,
+            )
+    _log_vram_snapshot("after encode")
+
+    vram_mgr.release(text_encoder_tenant)
+    vram_mgr.acquire(dit_tenant)
 
     if full_gpu_resident:
-        # Single tenant sized to the combined footprint — the whole
-        # pipeline stays GPU-resident for the duration of generation, so
-        # there's no text_encoder -> dit handoff to account for.
-        pipeline_tenant = Tenant(
-            name="pipeline",
-            estimated_bytes=combined_bytes,
-            load_fn=_load_pipeline,
-            unload_fn=_unload_pipeline,
-        )
-        vram_mgr.acquire(pipeline_tenant)
-
-        yield "Loading pipeline..."
-        pipe = _get_pipeline(gen_params.precision, full_gpu_resident)
-    else:
-        # Working set doesn't fit resident together — mirror the physical
-        # encode->offload->sample order that the accelerate cpu_offload
-        # hooks enforce inside the pipeline, keeping the app-wide VRAM
-        # ledger accurate for Phase 3/4 tenants.
-        text_encoder_tenant = Tenant(
-            name="text_encoder",
-            estimated_bytes=text_encoder_bytes,
-            load_fn=_load_pipeline,
-            unload_fn=_unload_pipeline,
-        )
-        dit_tenant = Tenant(
-            name="dit",
-            estimated_bytes=dit_peak_bytes,
-            load_fn=lambda: None,
-            unload_fn=lambda: None,
-        )
-
-        vram_mgr.acquire(text_encoder_tenant)
-
-        yield "Loading pipeline..."
-        pipe = _get_pipeline(gen_params.precision, full_gpu_resident)
-
-        vram_mgr.release(text_encoder_tenant)
-        vram_mgr.acquire(dit_tenant)
+        # With the text encoder parked on CPU, DiffusionPipeline's device
+        # inference can get confused. Verify the pipeline still executes
+        # on CUDA; if not, surface it loudly rather than silently
+        # sampling on CPU.
+        exec_device = pipe._execution_device
+        if exec_device.type != "cuda":
+            log.warning(
+                "Pipeline execution device resolved to %s with text "
+                "encoder parked on CPU — moving text encoder back to GPU "
+                "to restore CUDA execution",
+                exec_device,
+            )
+            pipe.text_encoder.to("cuda")
 
     # --- Generation loop ---
     all_images: list[Path] = []
@@ -685,8 +747,6 @@ def _generate_real(
     _DONE = object()
 
     for batch_num in range(gen_params.batch_count):
-        yield f"Encoding prompt... (batch {batch_num + 1}/{gen_params.batch_count})"
-
         batch_base_seed = base_seed + image_index
 
         # Build per-image generators for deterministic seeds
@@ -729,8 +789,15 @@ def _generate_real(
         def _worker() -> None:
             try:
                 step_clock["last"] = time.perf_counter()
+                # prompt_embeds instead of prompt: the pipeline skips its
+                # internal text-encoder forward (the encoder is parked on
+                # CPU by now) and duplicates the embeds to batch_size via
+                # num_images_per_prompt.
                 outcome["result"] = pipe(
-                    prompt=gen_params.prompt,
+                    prompt_embeds=prompt_embeds,
+                    prompt_embeds_mask=prompt_embeds_mask,
+                    negative_prompt_embeds=negative_embeds,
+                    negative_prompt_embeds_mask=negative_embeds_mask,
                     height=gen_params.height,
                     width=gen_params.width,
                     num_inference_steps=gen_params.steps,
@@ -777,11 +844,7 @@ def _generate_real(
 
     _log_vram_snapshot("after decode/save")
 
-    # Release whichever tenant is resident
-    if full_gpu_resident:
-        vram_mgr.release(pipeline_tenant)
-    else:
-        vram_mgr.release(dit_tenant)
+    vram_mgr.release(dit_tenant)
 
     # --- Final result ---
     yield {
