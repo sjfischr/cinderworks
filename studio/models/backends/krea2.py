@@ -16,6 +16,7 @@ import logging
 import queue
 import random
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Generator
@@ -252,6 +253,90 @@ def estimate_activation_bytes(width: int, height: int, batch_size: int) -> int:
 
 
 # ---------------------------------------------------------------------------
+# VRAM telemetry — the ground truth the estimates above are checked against
+# ---------------------------------------------------------------------------
+
+
+def _log_vram_snapshot(tag: str) -> None:
+    """Log a point-in-time CUDA memory snapshot under a tag.
+
+    Reports torch's allocated/peak/reserved alongside the driver's
+    free/total (mem_get_info). On Windows/WDDM the driver numbers are
+    dedicated VRAM only: if driver-free approaches zero while torch
+    keeps allocating, the overflow is going into shared system memory
+    over PCIe — the sysmem-spill tar pit. That condition is warned
+    explicitly because nothing else in the stack reports it.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return
+        free, total = torch.cuda.mem_get_info()
+        allocated = torch.cuda.memory_allocated()
+        peak = torch.cuda.max_memory_allocated()
+        reserved = torch.cuda.memory_reserved()
+        log.info(
+            "VRAM[%s]: torch allocated %.2f GB (peak %.2f GB), reserved "
+            "%.2f GB | driver free %.2f GB of %.2f GB dedicated",
+            tag,
+            allocated / 1e9,
+            peak / 1e9,
+            reserved / 1e9,
+            free / 1e9,
+            total / 1e9,
+        )
+        if free < 500_000_000:
+            log.warning(
+                "VRAM[%s]: dedicated VRAM nearly exhausted (%.2f GB free) — "
+                "any further allocation spills into WDDM shared system "
+                "memory and generation speed collapses",
+                tag,
+                free / 1e9,
+            )
+    except Exception:
+        log.debug("VRAM snapshot for '%s' failed", tag, exc_info=True)
+
+
+def _log_component_memory(pipe: Any) -> None:
+    """Log per-component parameter memory, dtype mix, and device placement.
+
+    This is the direct check on whether layerwise fp8 casting actually
+    took effect: a cast component shows most bytes as float8_e4m3fn with
+    a small bf16 remainder (skipped norm/embed modules). If a component
+    that should be cast shows all-bf16, the casting silently failed and
+    every VRAM estimate derived from it is wrong.
+    """
+    try:
+        for name in ("transformer", "text_encoder", "vae"):
+            component = getattr(pipe, name, None)
+            if component is None or not hasattr(component, "parameters"):
+                continue
+            bytes_by_dtype: dict[str, int] = {}
+            devices: set[str] = set()
+            total_bytes = 0
+            for p in component.parameters():
+                nbytes = p.numel() * p.element_size()
+                key = str(p.dtype).removeprefix("torch.")
+                bytes_by_dtype[key] = bytes_by_dtype.get(key, 0) + nbytes
+                devices.add(str(p.device))
+                total_bytes += nbytes
+            dtype_str = ", ".join(
+                f"{dt}: {b / 1e9:.2f} GB"
+                for dt, b in sorted(bytes_by_dtype.items(), key=lambda kv: -kv[1])
+            )
+            log.info(
+                "Component '%s': %.2f GB total on %s (%s)",
+                name,
+                total_bytes / 1e9,
+                "/".join(sorted(devices)),
+                dtype_str,
+            )
+    except Exception:
+        log.debug("Component memory breakdown failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
 # Pipeline Loading (lazy, cached)
 # ---------------------------------------------------------------------------
 
@@ -394,6 +479,8 @@ def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False
         pipe.enable_model_cpu_offload()
 
     log.info("Krea2Pipeline loaded (precision=%s, mode=%s)", precision, mode)
+    _log_component_memory(pipe)
+    _log_vram_snapshot("after pipeline load")
     _pipeline_cache[cache_key] = pipe
     return pipe
 
@@ -485,6 +572,14 @@ def _generate_real(
     """
     import torch
     from studio.core.vram_manager import Tenant
+
+    # Reset the peak-allocation counter so VRAM snapshots in this run
+    # report this generation's true peak, not a stale one.
+    try:
+        torch.cuda.reset_peak_memory_stats()
+    except Exception:
+        pass
+    _log_vram_snapshot("before pipeline load")
 
     dit_bytes = DIT_VRAM_TIERS.get(gen_params.precision, DIT_VRAM_TIERS["fp8_scaled"])
     text_encoder_bytes = TEXT_ENCODER_VRAM_TIERS.get(
@@ -606,18 +701,34 @@ def _generate_real(
         # --- so the UI shows real forward movement per step (R5.8). ---
         progress_q: queue.Queue = queue.Queue()
         outcome: dict[str, Any] = {}
+        step_clock = {"last": time.perf_counter()}
 
         def _step_callback(
             pipe_self: Any, step: int, timestep: Any, callback_kwargs: dict
         ) -> dict:
+            # Per-step wall time is the single most useful thrash
+            # indicator: resident fp8 sampling on this class of card
+            # should be well under a second per step; tens of seconds
+            # means weights are streaming over PCIe (WDDM spill).
+            now = time.perf_counter()
+            step_seconds = now - step_clock["last"]
+            step_clock["last"] = now
+            log.info(
+                "Sampling step %d/%d took %.2fs",
+                step + 1,
+                gen_params.steps,
+                step_seconds,
+            )
             progress_q.put(
                 f"Sampling step {step + 1}/{gen_params.steps} "
-                f"(batch {batch_num + 1}/{gen_params.batch_count})"
+                f"(batch {batch_num + 1}/{gen_params.batch_count}) "
+                f"— {step_seconds:.1f}s/step"
             )
             return callback_kwargs
 
         def _worker() -> None:
             try:
+                step_clock["last"] = time.perf_counter()
                 outcome["result"] = pipe(
                     prompt=gen_params.prompt,
                     height=gen_params.height,
@@ -628,6 +739,7 @@ def _generate_real(
                     generator=generators if len(generators) > 1 else generators[0],
                     callback_on_step_end=_step_callback,
                 )
+                _log_vram_snapshot(f"after sampling batch {batch_num + 1}")
             except Exception as exc:  # noqa: BLE001 — re-raised on main thread
                 outcome["error"] = exc
             finally:
@@ -662,6 +774,8 @@ def _generate_real(
             all_images.append(output_path)
             all_seeds.append(img_seed)
             image_index += 1
+
+    _log_vram_snapshot("after decode/save")
 
     # Release whichever tenant is resident
     if full_gpu_resident:
