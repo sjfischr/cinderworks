@@ -41,14 +41,20 @@ class Tenant:
 # Default total VRAM fallback when CUDA is not available (24 GB, RTX 4090)
 _DEFAULT_TOTAL_VRAM = 24 * 1024 * 1024 * 1024  # 24 GiB
 
-# Reserve subtracted from total VRAM when computing usable capacity.
-# On Windows/WDDM, the desktop compositor, browser, and driver reserve
-# ~1-1.5 GB of dedicated VRAM. A tenant estimate that exceeds usable
-# (not total) capacity will spill into shared system memory via WDDM
-# sysmem fallback — the GPU shows high utilization while the copy engine
-# thrashes weights over PCIe and generation slows to a crawl. Refusing
-# up front (R6.4, R7.5) is the honest failure mode.
-_VRAM_RESERVE = 1_500_000_000  # ~1.5 GB
+# Minimum reserve subtracted from total VRAM when computing usable
+# capacity. On Windows/WDDM, the desktop compositor, browser, and driver
+# reserve ~1-1.5 GB of dedicated VRAM. A tenant estimate that exceeds
+# usable (not total) capacity will spill into shared system memory via
+# WDDM sysmem fallback — the GPU shows high utilization while the copy
+# engine thrashes weights over PCIe and generation slows to a crawl.
+# Refusing up front (R6.4, R7.5) is the honest failure mode.
+_VRAM_RESERVE = 1_500_000_000  # ~1.5 GB floor
+
+# Safety margin added on top of the memory other processes are actually
+# holding at detection time. Desktop usage isn't static — browsers and
+# the compositor grow and shrink — so budgeting right up to the current
+# free amount invites a spill the moment anything else allocates.
+_VRAM_SAFETY = 1_000_000_000  # ~1 GB
 
 
 class VRAMManager:
@@ -205,20 +211,29 @@ class VRAMManager:
     def _detect_total_vram() -> int:
         """Detect the usable VRAM budget via torch.cuda, or fall back.
 
-        Auto-detected capacity has the WDDM/desktop reserve subtracted:
-        raw card capacity is never fully spendable on a machine driving a
-        display. An explicitly passed total_vram (tests, callers with
-        their own accounting) bypasses this and is taken at face value.
+        The reserve is dynamic: it is whatever other processes (desktop
+        compositor, browser, driver) are actually holding at detection
+        time plus a 1 GB safety margin, floored at the 1.5 GB static
+        estimate. A flat reserve under-budgets on a desktop with a
+        browser open (real usage was already measurable — use it) and
+        the safety margin absorbs growth after detection. An explicitly
+        passed total_vram (tests, callers with their own accounting)
+        bypasses this and is taken at face value.
         """
         try:
             import torch
 
             if torch.cuda.is_available():
-                _, total = torch.cuda.mem_get_info()
-                usable = total - _VRAM_RESERVE
+                free, total = torch.cuda.mem_get_info()
+                in_use_by_others = total - free
+                reserve = max(_VRAM_RESERVE, in_use_by_others + _VRAM_SAFETY)
+                usable = total - reserve
                 log.info(
-                    "Detected total VRAM: %s (usable budget %s after reserve)",
+                    "Detected total VRAM: %s (%s already in use by other "
+                    "processes; reserving %s; usable budget %s)",
                     _format_bytes(total),
+                    _format_bytes(in_use_by_others),
+                    _format_bytes(reserve),
                     _format_bytes(usable),
                 )
                 return usable
