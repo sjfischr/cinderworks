@@ -533,8 +533,8 @@ class TestPropertyOOMPreservation:
         for batch_idx in range(1, total_batches + 1):
             # Determine the tenant size for this batch
             if batch_idx == fail_at_batch:
-                # This batch requests more VRAM than available → triggers OOM
-                tenant_size = total_vram + 1
+                # This batch requests >110% of available VRAM → triggers OOM
+                tenant_size = int(total_vram * 1.2)
             else:
                 # Normal batch fits within available VRAM
                 tenant_size = batch_vram_need
@@ -610,8 +610,8 @@ class TestPropertyOOMPreservation:
 
         for batch_idx in range(1, total_batches + 1):
             if batch_idx == fail_at:
-                # Trigger OOM: request more than available
-                tenant_size = total_vram + 1
+                # Trigger OOM: request >110% of available (hard refusal threshold)
+                tenant_size = int(total_vram * 1.2)
             else:
                 tenant_size = batch_vram_need
 
@@ -713,7 +713,9 @@ class TestPropertyVRAMBatchRefusal:
         from hypothesis import assume
 
         estimated_need = batch_size * per_image_footprint
-        assume(estimated_need > total_vram)
+        # Must exceed total VRAM by more than 10% to trigger hard refusal
+        # (VRAM manager allows attempts within 10% headroom)
+        assume(estimated_need > total_vram * 1.1)
 
         mgr = VRAMManager(total_vram=total_vram)
 

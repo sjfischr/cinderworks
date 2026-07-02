@@ -71,7 +71,7 @@ SAMPLER_PARAM_KEYS = ["steps", "cfg", "mu_shift"]
 
 class TestPropertySamplerDefaults:
     """Property 8: For any subset of sampler parameters provided by the user,
-    omitted parameters SHALL use Turbo_Defaults (steps=8, cfg=1.0, mu_shift=1.15),
+    omitted parameters SHALL use Turbo_Defaults (steps=8, cfg=0.0, mu_shift=1.15),
     and provided parameters SHALL use the user-supplied values exactly.
 
     **Validates: Requirements 5.2**
@@ -638,7 +638,7 @@ class TestTurboDefaultsApplied:
         result = validate_params({"prompt": "test"})
 
         assert result.steps == 8, f"Expected steps=8, got {result.steps}"
-        assert result.cfg == 1.0, f"Expected cfg=1.0, got {result.cfg}"
+        assert result.cfg == 0.0, f"Expected cfg=0.0, got {result.cfg}"
         assert result.mu_shift == 1.15, f"Expected mu_shift=1.15, got {result.mu_shift}"
 
     def test_defaults_include_resolution_and_batch(self):

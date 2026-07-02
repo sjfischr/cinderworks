@@ -430,6 +430,14 @@ _TEST_EXPECTED_SIZES: dict[str, int] = {
     "qwen_image_vae.safetensors": 1_000,
 }
 
+# Flat file paths for tests (no subdirectories — matches test file creation)
+_TEST_HF_FILE_PATHS: dict[str, str] = {
+    "krea2_turbo_fp8_scaled.safetensors": "krea2_turbo_fp8_scaled.safetensors",
+    "krea2_turbo_bf16.safetensors": "krea2_turbo_bf16.safetensors",
+    "qwen3vl_4b_fp8_scaled.safetensors": "qwen3vl_4b_fp8_scaled.safetensors",
+    "qwen_image_vae.safetensors": "qwen_image_vae.safetensors",
+}
+
 
 # ---------------------------------------------------------------------------
 # Fixtures for unit tests
@@ -442,6 +450,9 @@ def model_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(Config, "MODEL_DIR", tmp_path)
     monkeypatch.setattr(
         "studio.models.downloader._EXPECTED_SIZES", _TEST_EXPECTED_SIZES
+    )
+    monkeypatch.setattr(
+        "studio.models.downloader._HF_FILE_PATHS", _TEST_HF_FILE_PATHS
     )
     return tmp_path
 

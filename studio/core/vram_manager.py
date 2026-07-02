@@ -94,31 +94,41 @@ class VRAMManager:
         # allocator may still hold reserved memory that mem_get_info doesn't
         # report as free. The actual allocation will succeed because the
         # allocator will reuse that reserved pool.
-        # We allow up to 95% of total VRAM to account for estimation imprecision.
-        available = int(self._total_vram * 0.95)
+        # We only refuse if the estimate exceeds total VRAM entirely (clearly won't fit).
+        available = self._total_vram
         log.info(
-            "VRAM check for '%s': needs %s, total VRAM %s (budget %s), torch free %s",
+            "VRAM check for '%s': needs %s, total VRAM %s, torch free %s",
             tenant.name,
             _format_bytes(tenant.estimated_bytes),
             _format_bytes(self._total_vram),
-            _format_bytes(available),
             _format_bytes(self._get_torch_free()),
         )
         if tenant.estimated_bytes > available:
-            log.error(
-                "VRAM insufficient for '%s': needs %s but budget is %s (total %s)",
-                tenant.name,
-                _format_bytes(tenant.estimated_bytes),
-                _format_bytes(available),
-                _format_bytes(self._total_vram),
-            )
-            raise VRAMError(
-                f"Not enough VRAM — '{tenant.name}' needs "
-                f"{_format_bytes(tenant.estimated_bytes)} but only "
-                f"{_format_bytes(available)} available (card total: "
-                f"{_format_bytes(self._total_vram)}). "
-                f"Try lowering batch size or switching to fp8_scaled precision."
-            )
+            # Estimate exceeds card capacity — warn but still attempt if close
+            headroom_pct = tenant.estimated_bytes / available
+            if headroom_pct > 1.1:
+                # More than 10% over — refuse
+                log.error(
+                    "VRAM insufficient for '%s': needs %s but total is %s (%.0f%% over)",
+                    tenant.name,
+                    _format_bytes(tenant.estimated_bytes),
+                    _format_bytes(available),
+                    (headroom_pct - 1) * 100,
+                )
+                raise VRAMError(
+                    f"Not enough VRAM — '{tenant.name}' needs "
+                    f"{_format_bytes(tenant.estimated_bytes)} but card has "
+                    f"{_format_bytes(available)} total. "
+                    f"Try lowering batch size or switching to fp8_scaled precision."
+                )
+            else:
+                # Within 10% — attempt anyway (estimates are imprecise)
+                log.warning(
+                    "VRAM tight for '%s': needs %s, card has %s. Attempting anyway.",
+                    tenant.name,
+                    _format_bytes(tenant.estimated_bytes),
+                    _format_bytes(available),
+                )
 
         # Load the new tenant
         log.info(

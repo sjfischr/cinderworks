@@ -58,7 +58,7 @@ class TestExactlyOneEntry:
         assert len(entry.checkpoints) > 0
         assert entry.vae != ""
         assert entry.text_encoder != ""
-        assert entry.sampler_defaults == {"steps": 8, "cfg": 1.0, "mu_shift": 1.15}
+        assert entry.sampler_defaults == {"steps": 8, "cfg": 0.0, "mu_shift": 1.15}
         assert "bf16" in entry.precision_options
         assert "fp8_scaled" in entry.precision_options
 

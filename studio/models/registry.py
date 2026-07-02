@@ -52,7 +52,7 @@ _REGISTRY: list[RegistryEntry] = [
         ],
         vae="qwen_image_vae.safetensors",
         text_encoder="qwen3vl_4b_fp8_scaled.safetensors",
-        sampler_defaults={"steps": 8, "cfg": 1.0, "mu_shift": 1.15},
+        sampler_defaults={"steps": 8, "cfg": 0.0, "mu_shift": 1.15},
         precision_options=["bf16", "fp8_scaled"],
         vram_tiers={
             "bf16": 23_500_000_000,
