@@ -14,12 +14,12 @@ gradio==5.33.0
 #   uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
 # Do NOT include torch here — it will install CPU-only from PyPI.
 diffusers>=0.38.0
-transformers==4.52.4
+transformers>=4.52.0
 safetensors>=0.8.0
-accelerate==1.7.0
+accelerate>=1.7.0
 
 # --- Model Hub ---
-huggingface_hub[hf_xet]==0.32.4
+huggingface_hub[hf_xet]>=0.34.0
 
 # --- Config ---
 python-dotenv==1.1.0
