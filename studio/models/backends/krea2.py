@@ -310,6 +310,9 @@ def _log_component_memory(pipe: Any) -> None:
     try:
         for name in ("transformer", "text_encoder", "vae"):
             component = getattr(pipe, name, None)
+            if component is None and name == "text_encoder":
+                # Parked encoders are detached from the pipeline
+                component = getattr(pipe, _PARKED_TE_ATTR, None)
             if component is None or not hasattr(component, "parameters"):
                 continue
             bytes_by_dtype: dict[str, int] = {}
@@ -474,14 +477,22 @@ def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False
         pipe.to("cuda")
         # The text encoder only runs once per generation (we pre-encode
         # and pass prompt_embeds to the pipeline), so it does NOT need
-        # to occupy VRAM during the long sampling phase. Park it in
-        # system RAM; the text_encoder tenant moves it up for the encode
-        # and back down after. Telemetry showed that keeping it resident
-        # pushed dedicated VRAM to ~85% occupancy before sampling even
-        # started — on WDDM the driver responds to that pressure by
-        # silently migrating pages to shared system memory.
-        pipe.text_encoder.to("cpu")
-        torch.cuda.empty_cache()
+        # to occupy VRAM during the long sampling phase. Telemetry showed
+        # that keeping it resident pushed dedicated VRAM to ~85%
+        # occupancy before sampling even started — on WDDM the driver
+        # responds to that pressure by silently migrating pages to
+        # shared system memory.
+        #
+        # Parking it on CPU is not enough: DiffusionPipeline resolves
+        # its execution device from an UNORDERED set of component
+        # modules, and if the parked encoder wins that lottery the whole
+        # pipeline "executes" on CPU (observed in the field — the device
+        # guard fired and undid the parking). So the encoder is fully
+        # DETACHED from the pipeline while parked and held under a
+        # private attribute; the text_encoder tenant reattaches it just
+        # for the encode. With only CUDA-resident modules attached,
+        # device resolution is deterministic.
+        _park_text_encoder(pipe)
     else:
         log.info(
             "Working set exceeds usable VRAM budget — using "
@@ -499,6 +510,50 @@ def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False
 def _clear_pipeline_cache() -> None:
     """Clear the pipeline cache. For testing only."""
     _pipeline_cache.clear()
+
+
+# Attribute under which the detached text encoder is held while parked.
+# Underscore-prefixed so DiffusionPipeline's __setattr__ config plumbing
+# and components discovery never see it as a pipeline module.
+_PARKED_TE_ATTR = "_cinderworks_parked_text_encoder"
+
+
+def _park_text_encoder(pipe: Any) -> None:
+    """Move the text encoder to CPU and detach it from the pipeline.
+
+    Detaching (pipe.text_encoder = None) is what makes the pipeline's
+    device inference ignore the parked encoder — see the comment at the
+    call site in _get_pipeline. No-op if already parked.
+    """
+    te = getattr(pipe, "text_encoder", None)
+    if te is None:
+        return
+    te.to("cpu")
+    pipe.text_encoder = None
+    setattr(pipe, _PARKED_TE_ATTR, te)
+    import torch
+
+    # Return freed blocks to the driver — WDDM pressure counts
+    # reserved-but-unused pages too.
+    torch.cuda.empty_cache()
+    log.info("Text encoder parked in system RAM (detached from pipeline)")
+
+
+def _unpark_text_encoder(pipe: Any) -> None:
+    """Reattach the parked text encoder and move it to the GPU.
+
+    No-op if the encoder is already attached (offload mode, where the
+    accelerate hooks own placement and parking never happens).
+    """
+    if getattr(pipe, "text_encoder", None) is not None:
+        return
+    te = getattr(pipe, _PARKED_TE_ATTR, None)
+    if te is None:
+        return
+    te.to("cuda")
+    pipe.text_encoder = te
+    setattr(pipe, _PARKED_TE_ATTR, None)
+    log.info("Text encoder reattached and moved to GPU for encode")
 
 
 # ---------------------------------------------------------------------------
@@ -661,18 +716,12 @@ def _generate_real(
         # First acquire also loads the pipeline itself (lazy).
         pipeline_ref["pipe"] = _get_pipeline(gen_params.precision, full_gpu_resident)
         if full_gpu_resident:
-            log.info("Moving text encoder to GPU for encode")
-            pipeline_ref["pipe"].text_encoder.to("cuda")
+            _unpark_text_encoder(pipeline_ref["pipe"])
         # In offload mode the accelerate hooks own placement — nothing to do.
 
     def _unload_text_encoder() -> None:
         if full_gpu_resident and pipeline_ref["pipe"] is not None:
-            log.info("Returning text encoder to system RAM")
-            pipeline_ref["pipe"].text_encoder.to("cpu")
-            # Return the freed blocks to the driver, not just to torch's
-            # caching allocator — WDDM pressure is measured by the
-            # driver, and reserved-but-unused pages still count.
-            torch.cuda.empty_cache()
+            _park_text_encoder(pipeline_ref["pipe"])
 
     text_encoder_tenant = Tenant(
         name="text_encoder",
@@ -722,19 +771,20 @@ def _generate_real(
     vram_mgr.acquire(dit_tenant)
 
     if full_gpu_resident:
-        # With the text encoder parked on CPU, DiffusionPipeline's device
-        # inference can get confused. Verify the pipeline still executes
-        # on CUDA; if not, surface it loudly rather than silently
-        # sampling on CPU.
+        # With the encoder detached, every module still attached to the
+        # pipeline is CUDA-resident, so device resolution must be cuda.
+        # If it isn't, something is structurally wrong — refuse rather
+        # than silently sample on CPU (a multi-hour hang, the dishonest
+        # failure mode).
         exec_device = pipe._execution_device
+        log.info("Pipeline execution device for sampling: %s", exec_device)
         if exec_device.type != "cuda":
-            log.warning(
-                "Pipeline execution device resolved to %s with text "
-                "encoder parked on CPU — moving text encoder back to GPU "
-                "to restore CUDA execution",
-                exec_device,
+            raise RuntimeError(
+                f"Pipeline resolved to execution device '{exec_device}' "
+                f"even with the text encoder detached — refusing to "
+                f"sample on CPU. This indicates a diffusers device-"
+                f"resolution change; please report this log."
             )
-            pipe.text_encoder.to("cuda")
 
     # --- Generation loop ---
     all_images: list[Path] = []
