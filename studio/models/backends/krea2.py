@@ -207,9 +207,13 @@ def resolve_seed(seed: int | None) -> int:
 def _get_pipeline() -> Any:
     """Get or load the Krea2Pipeline (lazy singleton).
 
-    On first call, loads from HuggingFace (auto-downloads diffusers-format
-    weights from krea/Krea-2-Turbo). Subsequent calls return the cached
-    pipeline immediately.
+    On first call, loads from a local directory if available, otherwise
+    falls back to downloading from HuggingFace. Subsequent calls return
+    the cached pipeline immediately.
+
+    Local path priority:
+    1. Config.MODEL_DIR / "krea2-turbo-diffusers" (pre-downloaded via `hf download`)
+    2. HuggingFace hub auto-download from "krea/Krea-2-Turbo"
 
     The pipeline uses model_cpu_offload for memory efficiency — components
     are moved to GPU only when needed and back to CPU after.
@@ -225,11 +229,19 @@ def _get_pipeline() -> Any:
 
     import torch
     from diffusers import Krea2Pipeline
+    from studio.config import Config
 
-    log.info("Loading Krea2Pipeline from '%s' (first use — this may download ~36 GB)", _HF_MODEL_ID)
+    # Check for local diffusers-format weights first
+    local_path = Config.MODEL_DIR / "krea2-turbo-diffusers"
+    if local_path.is_dir() and (local_path / "model_index.json").is_file():
+        log.info("Loading Krea2Pipeline from local path: %s", local_path)
+        source = str(local_path)
+    else:
+        log.info("Loading Krea2Pipeline from '%s' (first use — this may download ~36 GB)", _HF_MODEL_ID)
+        source = _HF_MODEL_ID
 
     pipe = Krea2Pipeline.from_pretrained(
-        _HF_MODEL_ID,
+        source,
         torch_dtype=torch.bfloat16,
     )
 
