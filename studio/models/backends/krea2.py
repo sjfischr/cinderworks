@@ -484,6 +484,13 @@ def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False
             *torch.cuda.get_device_capability(0),
             __import__("diffusers").__version__,
         )
+        log.info(
+            "SDPA backends enabled: flash=%s, mem_efficient=%s, math=%s, cudnn=%s",
+            torch.backends.cuda.flash_sdp_enabled(),
+            torch.backends.cuda.mem_efficient_sdp_enabled(),
+            torch.backends.cuda.math_sdp_enabled(),
+            getattr(torch.backends.cuda, "cudnn_sdp_enabled", lambda: "n/a")(),
+        )
     except Exception:
         pass
 
@@ -908,6 +915,8 @@ def _generate_real(
 
         def _worker() -> None:
             try:
+                from torch.nn.attention import SDPBackend, sdpa_kernel
+
                 step_clock["last"] = time.perf_counter()
                 log.info(
                     "Worker entering pipeline call (batch %d/%d)",
@@ -918,19 +927,34 @@ def _generate_real(
                 # internal text-encoder forward (the encoder is parked on
                 # CPU by now) and duplicates the embeds to batch_size via
                 # num_images_per_prompt.
-                outcome["result"] = pipe(
-                    prompt_embeds=prompt_embeds,
-                    prompt_embeds_mask=prompt_embeds_mask,
-                    negative_prompt_embeds=negative_embeds,
-                    negative_prompt_embeds_mask=negative_embeds_mask,
-                    height=gen_params.height,
-                    width=gen_params.width,
-                    num_inference_steps=gen_params.steps,
-                    guidance_scale=gen_params.cfg,
-                    num_images_per_prompt=gen_params.batch_size,
-                    generator=generators if len(generators) > 1 else generators[0],
-                    callback_on_step_end=_step_callback,
-                )
+                #
+                # The sdpa_kernel context BANS the math attention backend
+                # for the whole sampling+decode call. Math attention
+                # materializes the full fp32 attention matrix (multi-GB at
+                # ~4600 tokens x 24 heads, 28 blocks per step) — observed
+                # in the field filling dedicated VRAM to 23.7/24.5 GiB and
+                # forcing WDDM to demote weight pages to shared system
+                # memory (GPU pegged at "100%" but ~116 W / 1% memory
+                # throughput). Flash/mem-efficient compute the same result
+                # in ~100 MB tiles. If neither can handle the inputs,
+                # torch raises an error naming the exact constraint —
+                # the honest failure instead of an hour-long crawl.
+                with sdpa_kernel(
+                    [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
+                ):
+                    outcome["result"] = pipe(
+                        prompt_embeds=prompt_embeds,
+                        prompt_embeds_mask=prompt_embeds_mask,
+                        negative_prompt_embeds=negative_embeds,
+                        negative_prompt_embeds_mask=negative_embeds_mask,
+                        height=gen_params.height,
+                        width=gen_params.width,
+                        num_inference_steps=gen_params.steps,
+                        guidance_scale=gen_params.cfg,
+                        num_images_per_prompt=gen_params.batch_size,
+                        generator=generators if len(generators) > 1 else generators[0],
+                        callback_on_step_end=_step_callback,
+                    )
                 _log_vram_snapshot(f"after sampling batch {batch_num + 1}")
             except Exception as exc:  # noqa: BLE001 — re-raised on main thread
                 outcome["error"] = exc
