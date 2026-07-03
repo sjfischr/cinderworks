@@ -76,8 +76,17 @@ echo "[Cinderworks] Installing pinned dependencies from requirements.txt..."
 # same version number (PEP 440 ignores local version tags in a bare
 # ==X.Y.Z match), so a bare version spec can silently resolve to the
 # wrong wheel once a PyPI fallback index is available (see uv.toml).
+# --index-strategy unsafe-best-match is REQUIRED here too: uv.toml's
+# extra-index-url (pypi, needed for non-torch packages) becomes part of
+# resolution even with --index-url set on this command, and uv's
+# default "first-index" strategy commits to whichever index it finds
+# torch on FIRST and refuses to check others even for an exact pinned
+# version they don't have. "unsafe-best-match" is safe specifically
+# because we always pin the full build tag here (torch==2.7.0+cu128) —
+# there is no ambiguity for an attacker to exploit via a same-named
+# PyPI package at a different version.
 echo "[Cinderworks] Installing PyTorch with CUDA support..."
-uv pip install --python "$VENV_DIR/bin/python" torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128
+uv pip install --python "$VENV_DIR/bin/python" torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match
 if [ $? -ne 0 ]; then
     echo "[Cinderworks] ERROR: Failed to install PyTorch with CUDA."
     exit 1
