@@ -19,7 +19,7 @@ This spec is scoped strictly to Phase 1. Prompt-optimizer LLM, LoRA training, ad
 - **Batch_Size**: The number of images generated in a single parallel pass (VRAM-bound).
 - **Batch_Count**: The number of sequential batches to run (queue-bound).
 - **Precision**: The floating-point format used for model weights (bf16 or fp8_scaled in Phase 1).
-- **Turbo_Defaults**: 8 steps, CFG 1.0 (disabled), fixed mu/shift 1.15.
+- **Turbo_Defaults**: 8 steps, CFG 0.0 (guidance disabled per Krea convention), fixed mu/shift 1.15.
 - **Downloader**: The module responsible for streaming, resumable model downloads via huggingface_hub.
 - **Readiness_Banner**: A plain-language UI element that communicates what is missing before generation can occur.
 
@@ -31,9 +31,9 @@ This spec is scoped strictly to Phase 1. Prompt-optimizer LLM, LoRA training, ad
 
 #### Acceptance Criteria
 
-1. WHEN the Bootstrap_Script is run on a machine with Python 3.11, Git, and uv present, THE System SHALL create a project-local virtual environment, install the exact-pinned dependencies from the committed lock file, and launch the Gradio server such that the UI is accessible at a localhost URL without further manual steps.
+1. WHEN the Bootstrap_Script is run on a machine with Python 3.11+, Git, and uv present, THE System SHALL create a project-local virtual environment, install the exact-pinned dependencies from the committed lock file, and launch the Gradio server such that the UI is accessible at a localhost URL without further manual steps.
 2. WHEN the app launches, THE System SHALL NOT perform any git pull or self-directed pip install or upgrade of its own environment.
-3. IF a prerequisite required by the bootstrap script itself (Python 3.11, Git, or uv) is not found, THEN THE System SHALL report which prerequisite is missing by name and exit non-zero without creating or modifying the virtual environment.
+3. IF a prerequisite required by the bootstrap script itself (Python 3.11+, Git, or uv) is not found, THEN THE System SHALL report which prerequisite is missing by name and exit non-zero without creating or modifying the virtual environment.
 4. IF a Python dependency required to boot the shell is missing or fails to import after installation, THEN THE System SHALL report the specific missing dependency by package name in plain language and exit non-zero, rather than partially starting.
 5. WHEN the app starts, THE System SHALL detect the presence or absence of CUDA, store the result in the readiness state used by the readiness banner, and continue startup regardless of the outcome so that the UI remains accessible when CUDA is absent.
 
@@ -82,7 +82,7 @@ This spec is scoped strictly to Phase 1. Prompt-optimizer LLM, LoRA training, ad
 #### Acceptance Criteria
 
 1. WHEN the owner submits a prompt while the system is Ready_to_Generate, THE System SHALL load the Qwen3-VL text encoder, encode the prompt using the baked template with multi-layer hidden-state aggregation from the 12 selected layers, and then offload the text encoder before loading the diffusion model.
-2. WHEN encoding is complete, THE System SHALL load the Krea 2 Turbo diffusion model and sample using Turbo_Defaults (8 steps, CFG 1.0 disabled, fixed mu/shift 1.15) unless the owner has overridden the exposed parameters.
+2. WHEN encoding is complete, THE System SHALL load the Krea 2 Turbo diffusion model and sample using Turbo_Defaults (8 steps, guidance_scale 0.0 disabled, fixed mu/shift 1.15) unless the owner has overridden the exposed parameters.
 3. WHEN sampling is complete, THE System SHALL decode the latents with the Qwen-Image VAE and display the resulting image in the UI.
 4. WHEN the owner sets a specific seed, THE System SHALL use that seed, and WHEN no seed is set, THE System SHALL generate a random seed, record it in the Job, and use it for generation so the result is reproducible.
 5. WHEN the owner adjusts an exposed parameter (steps: 1–100, seed: 0–2^32-1, width: 512–2048 in multiples of 64, height: 512–2048 in multiples of 64, Batch_Size, Batch_Count, Precision), THE System SHALL validate the value is within bounds and apply it to the generation.

@@ -8,8 +8,7 @@ inclusion: auto
 
 ## Language & Runtime
 
-- **Python 3.11** (pin to 3.11.x; matches the Forge/Krea ecosystem and avoids
-  3.12+ wheel gaps for ML deps).
+- **Python 3.11+** (3.11, 3.12, or 3.13 all work; torch 2.7+ has wheels for all).
 - Manage the environment with **`uv`** (fast, reproducible) creating a
   project-local `venv`.
 - Never let the app auto-recreate or auto-upgrade its own environment at launch.
@@ -37,7 +36,7 @@ inclusion: auto
   `krea2_turbo_bf16.safetensors` (~25 GB).
 - Text encoder: `qwen3vl_4b_fp8_scaled.safetensors`.
 - VAE: `qwen_image_vae.safetensors`.
-- Turbo sampler defaults: **8 steps, CFG 1.0 (disabled), fixed mu/shift 1.15**.
+- Turbo sampler defaults: **8 steps, guidance_scale 0.0 (disabled per Krea convention), fixed mu/shift 1.15**.
 
 ## Persistence
 
@@ -53,8 +52,12 @@ inclusion: auto
 
 ## Dependency Discipline
 
-- **Pin everything.** `requirements.txt` with exact `==` versions. A `uv.lock`
-  is committed.
+- **Pin where stable, floor where evolving.** Core UI and testing deps use exact
+  `==` versions. ML deps (diffusers, transformers, safetensors, accelerate) use
+  `>=` minimums because the Krea 2 pipeline is on diffusers `main` branch and
+  its transitive deps evolve rapidly.
+- **Torch is installed separately** from the CUDA index by the bootstrap script
+  (not from PyPI which is CPU-only).
 - **No auto-self-update.** The app never `git pull`s or `pip install`s itself on
   launch.
 - **Decouple model backends from the shell.** A backend importing a broken dep
