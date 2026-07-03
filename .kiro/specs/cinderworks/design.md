@@ -197,7 +197,7 @@ Implements the load→encode→offload→load→sample→decode sequence using `
 2. Wrap prompt in Krea's baked template; encode; aggregate 12 selected hidden-state layers
 3. `vram_manager.release(text_encoder)`
 4. `vram_manager.acquire(dit)` → load Krea 2 Turbo DiT at chosen precision
-5. Euler flow sampling: 8 steps, CFG 1.0 (disabled), fixed mu/shift 1.15 (Turbo defaults). Batch image *i* uses `seed + i`
+5. Euler flow sampling: 8 steps, CFG 0.0 (guidance disabled per Krea convention), fixed mu/shift 1.15 (Turbo defaults). Batch image *i* uses `seed + i`
 6. Decode via Qwen-Image VAE (tiled decode option for headroom)
 
 Returns images + resolved params (including actual seed) for persistence.
@@ -246,7 +246,7 @@ CREATE TABLE artifact (
 class GenerationParams:
     prompt: str
     steps: int = 8            # Turbo default
-    cfg: float = 1.0          # disabled for Turbo
+    cfg: float = 0.0          # guidance disabled for Turbo (Krea convention: 0.0)
     mu_shift: float = 1.15    # fixed for Turbo
     width: int = 1024
     height: int = 1024
@@ -273,12 +273,14 @@ class Tenant:
 
 ### Krea 2 Model Files (from Comfy-Org/Krea-2)
 
-| Component | Filename | Size (approx) | Precision |
-|-----------|----------|---------------|-----------|
-| Diffusion DiT (Turbo) | `krea2_turbo_fp8_scaled.safetensors` | ~13 GB | fp8_scaled |
-| Diffusion DiT (Turbo) | `krea2_turbo_bf16.safetensors` | ~25 GB | bf16 |
-| Text Encoder | `qwen3vl_4b_fp8_scaled.safetensors` | ~4 GB | fp8_scaled |
-| VAE | `qwen_image_vae.safetensors` | ~0.5 GB | — |
+| Component | HF Repo Path | Size (approx) | Precision |
+|-----------|--------------|---------------|-----------|
+| Diffusion DiT (Turbo) | `diffusion_models/krea2_turbo_fp8_scaled.safetensors` | ~13.1 GB | fp8_scaled |
+| Diffusion DiT (Turbo) | `diffusion_models/krea2_turbo_bf16.safetensors` | ~26.3 GB | bf16 |
+| Text Encoder | `text_encoders/qwen3vl_4b_fp8_scaled.safetensors` | ~5.24 GB | fp8_scaled |
+| VAE | `vae/qwen_image_vae.safetensors` | ~254 MB | — |
+
+**Note:** For inference, the backend uses `Krea2Pipeline` from diffusers (main branch), which loads diffusers-format weights from `krea/Krea-2-Turbo` on HuggingFace or from a local directory at `MODEL_DIR/krea2-turbo-diffusers/`. The Comfy-Org safetensors above are downloaded by the in-app downloader for readiness status tracking. A future iteration (Option B) will consolidate to a single set of weights.
 
 
 ## Correctness Properties
@@ -329,7 +331,7 @@ class Tenant:
 
 ### Property 8: Sampler parameters default to Turbo unless explicitly overridden
 
-*For any* subset of sampler parameters provided by the user, omitted parameters SHALL use Turbo_Defaults (steps=8, cfg=1.0, mu_shift=1.15), and provided parameters SHALL use the user-supplied values exactly.
+*For any* subset of sampler parameters provided by the user, omitted parameters SHALL use Turbo_Defaults (steps=8, cfg=0.0, mu_shift=1.15), and provided parameters SHALL use the user-supplied values exactly.
 
 **Validates: Requirements 5.2**
 

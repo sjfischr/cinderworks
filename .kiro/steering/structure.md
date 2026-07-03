@@ -16,7 +16,9 @@ studio/
 │                               #   Thin — delegates all logic to modules below.
 ├── config.py                   # Config object; resolves paths from .env
 ├── .env.example                # MODEL_DIR, OUTPUT_DIR, APP_NAME, DB_PATH
-├── requirements.txt            # exact-pinned deps
+├── requirements.txt            # deps (pinned where stable, >= where evolving)
+├── launch.bat                  # Quick-start: activates venv, runs app (Windows)
+├── launch.sh                   # Quick-start: activates venv, runs app (Linux)
 ├── ui/
 │   ├── theme.py                # glassmorphism CUSTOM_CSS
 │   ├── handlers.py             # Gradio event handlers; wrap workers, surface
@@ -33,22 +35,31 @@ studio/
 │   ├── registry.py             # model-agnostic registry; Phase 1 = 1 entry
 │   ├── downloader.py           # streaming, resumable HF downloader (generator)
 │   └── backends/
-│       └── krea2.py            # Krea 2 backend: encode, sample, decode
+│       └── krea2.py            # Krea 2 backend via diffusers Krea2Pipeline
 ├── db/
 │   └── db.py                   # init_db, create_job, get_recent_jobs, get_job,
-│                               #   get_job_artifacts (plain sqlite3, no ORM)
+│                               #   get_job_artifacts, delete_job (plain sqlite3)
 ├── install/
 │   ├── bootstrap.bat           # Windows one-click: uv venv, pinned install, run
 │   └── bootstrap.sh            # Linux/Mac equivalent
-├── outputs/                    # generated images: outputs/job_<id>/*.png
+├── outputs/                    # generated images: outputs/krea2_<seed>/*.png
 ├── models_store/               # downloaded weights (== MODEL_DIR default)
+│   ├── diffusion_models/       # Comfy-Org DiT checkpoints
+│   ├── text_encoders/          # Comfy-Org Qwen3-VL encoder
+│   ├── vae/                    # Comfy-Org Qwen-Image VAE
+│   └── krea2-turbo-diffusers/  # diffusers-format weights (for Krea2Pipeline)
 └── tests/
-    ├── test_downloader.py
-    ├── test_system_check.py
+    ├── conftest.py
+    ├── test_config.py
+    ├── test_controls.py
     ├── test_db.py
-    ├── test_vram_manager.py
+    ├── test_downloader.py
+    ├── test_handlers.py
+    ├── test_krea2_backend.py
+    ├── test_model_loader.py
     ├── test_registry.py
-    └── test_krea2_backend.py
+    ├── test_system_check.py
+    └── test_vram_manager.py
 ```
 
 ## Module Boundary Rules (Enforced)
