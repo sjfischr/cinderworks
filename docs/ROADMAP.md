@@ -27,15 +27,38 @@ The bar: a Forge Neo user with a 12–24 GB NVIDIA card can switch and
 not miss anything they use weekly. Roughly ordered:
 
 ### M1 — Generation completeness
+
+- [ ] **LoRA loading (multi-stack, weighted)** — load one or more LoRAs
+      from a `loras/` folder, each with a decimal weight value (0.0–2.0).
+      Follow the exact Forge Neo pattern: stack multiple LoRAs, apply at
+      generation time, unload when switching. Krea 2 official LoRAs +
+      community LoRAs supported. UI: list of loaded LoRAs with weight
+      sliders, add/remove buttons.
+- [ ] **Model checkpoint selector** — dropdown in the Generate tab to
+      choose the active model. Phase 1: all Krea 2 family checkpoints
+      (Turbo fp8, Turbo bf16, Raw fp8, Raw bf16). Wiring must support
+      non-Krea models (e.g. zImage) via the existing registry — adding
+      a new model entry + backend module should populate the dropdown
+      automatically with no UI code changes.
+- [ ] **Image-to-image with inpainting** — push any generated image
+      directly to an img2img/inpaint workflow from the gallery. Includes:
+      init image input, denoise strength slider, mask editor (brush-based
+      inpainting). Same "send to" pattern as Forge Neo.
+- [ ] **Upscale from gallery** — push a generated image directly to the
+      upscaler from the generation screen (one-click enlarge). Uses the
+      existing spandrel-based Real-ESRGAN pipeline.
+- [ ] **Gallery keyboard navigation** — scroll through generated images
+      using left/right arrow keys. Focus the gallery and use keyboard
+      to browse without mouse.
 - [ ] Negative prompts (Raw model; Turbo is CFG-free)
 - [ ] Krea 2 Raw support (full-step, CFG) alongside Turbo
-- [ ] Image-to-image (init image + denoise strength)
 - [ ] Seed variation tools: reuse seed from gallery image, increment,
       random-batch
 - [ ] PNG metadata embed (params in the file, Forge/A1111-compatible
       format) + drag-a-PNG-to-restore-params
 
 ### M2 — Memory tiers for smaller cards (the Forge "GPU Weights" story)
+
 - [ ] Streamed group offloading fallback (diffusers
       `enable_group_offload(leaf_level, use_stream=True)`) so 12–16 GB
       cards run fp8 and 24 GB cards can run bf16 — slower but working,
@@ -46,18 +69,18 @@ not miss anything they use weekly. Roughly ordered:
       right tier instead of refusing)
 
 ### M3 — Quality-of-life parity
-- [ ] LoRA loading (Krea 2 official + community LoRAs, weight slider)
+
 - [ ] Upscaler model picker (4x-UltraSharp, RealESRGAN-anime, any
       spandrel-loadable file dropped into models_store)
 - [ ] Hires-fix-style two-pass: generate → upscale → img2img refine
 - [ ] Queue: fire-and-forget multiple jobs, cancel button
       (batch_count exists; needs a visible queue + cancellation)
-- [ ] Gallery niceties: send-to-upscale, send-to-img2img, open output
-      folder, compare A/B
+- [ ] Gallery niceties: compare A/B, open output folder
 
 ### M4 — Robustness / distribution
-- [ ] One-click install (bootstrap already exists; add torch-CUDA
-      detection + version pinning sanity checks)
+
+- [ ] One-click install improvements (torch-CUDA detection + version
+      pinning sanity checks beyond what bootstrap already does)
 - [ ] Settings tab: output dir, VRAM reserve override, precision
       default, attention backend picker
 - [ ] Crash-free session restore (queue + params survive restart)
@@ -74,7 +97,7 @@ not miss anything they use weekly. Roughly ordered:
 - **Prompt assistant** — local LLM (the Qwen3-VL encoder is already a
   VLM!) for prompt expansion/rewrites; Phase 3/4 tenant slots exist in
   the VRAM manager for exactly this
-- **Inpainting / outpainting** with mask editor
+- **Outpainting** with mask editor (extend canvas beyond borders)
 - **ControlNet-style conditioning** as Krea 2 ecosystem support lands
 - **LoRA training** (musubi-tuner already supports Krea 2; wrap the
   train-on-Raw / infer-on-Turbo loop)
@@ -96,3 +119,23 @@ not miss anything they use weekly. Roughly ordered:
 3. The shell stays thin — backends do the work; a new model must never
    require UI surgery.
 4. "Still works tomorrow" — pinned deps, no surprise upgrades.
+
+## LoRA Implementation Reference (Forge Neo Pattern)
+
+The LoRA implementation follows the Forge Neo approach:
+
+- **Storage:** `studio/loras/` folder (configurable via Config). Any
+  `.safetensors` LoRA file dropped in is auto-detected.
+- **UI:** A collapsible panel in the Generate tab with:
+  - File browser / dropdown to select LoRAs from the folder
+  - "Add LoRA" button (supports multiple stacked LoRAs)
+  - Per-LoRA weight slider (0.0 to 2.0, default 1.0)
+  - Remove button per LoRA
+- **Application:** LoRAs are fused into the pipeline at generation time
+  via `pipe.load_lora_weights()` / `pipe.fuse_lora()`. Multiple LoRAs
+  stack additively (Forge Neo behavior).
+- **Lifecycle:** LoRAs are loaded fresh per generation (not persistently
+  fused). Changing LoRA selection between generations does not require
+  pipeline reload.
+- **Krea 2 convention:** Train on Raw, apply on Turbo. Both model
+  variants accept the same LoRA files.
