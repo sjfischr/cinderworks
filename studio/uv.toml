@@ -12,6 +12,14 @@
 # torch is still deliberately excluded from requirements.txt (see the
 # comment there) — this file is what makes any OTHER uv pip install in
 # this project safe to run without re-breaking that pin.
+#
+# IMPORTANT: this index alone is not sufficient protection for manual
+# `torch==X.Y.Z` installs/reinstalls. PEP 440 ignores local version tags
+# in a bare ==X.Y.Z match, so "torch==2.7.0" matches BOTH this index's
+# 2.7.0+cu128 build AND any plain-PyPI 2.7.0 (CPU) build — uv can pick
+# whichever it resolves/caches first, defeating the index-url above.
+# Always pin the FULL build tag explicitly: torch==2.7.0+cu128,
+# torchvision==0.22.0+cu128, etc. See install/bootstrap.bat|sh.
 [pip]
 index-url = "https://download.pytorch.org/whl/cu128"
 extra-index-url = ["https://pypi.org/simple"]
