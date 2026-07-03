@@ -7,8 +7,7 @@ A local-first image generation studio with a Gradio web UI. Phase 1 ships the co
 ## Features
 
 - One-click install via bootstrap script (Windows & Linux)
-- Krea 2 Turbo image generation (8-step Turbo mode, bf16 or fp8_scaled precision)
-- Real inference via diffusers `Krea2Pipeline` with automatic model CPU offload
+- Krea 2 Turbo image generation (8-step Turbo mode, guidance disabled)
 - In-app model download with streaming progress and resume-on-interrupt
 - VRAM tenant discipline — automatic GPU memory management on 24 GB cards
 - Full generation history with parameter recall, reproduction, and deletion
@@ -22,8 +21,9 @@ A local-first image generation studio with a Gradio web UI. Phase 1 ships the co
 | Python | 3.11+ | 3.11, 3.12, or 3.13 all work |
 | Git | any | For cloning |
 | uv | any | Python package installer — [install guide](https://docs.astral.sh/uv/getting-started/installation/) |
-| NVIDIA GPU | 24 GB VRAM recommended | RTX 4090, 3090, etc. fp8_scaled works with ~13 GB |
+| NVIDIA GPU | 24 GB VRAM recommended | RTX 4090, 3090, etc. |
 | CUDA | 12.x | Matching your torch build |
+| hf (optional) | any | HuggingFace CLI for faster model downloads |
 
 ## Quick Start
 
@@ -35,23 +35,27 @@ cd cinderworks\studio
 install\bootstrap.bat
 ```
 
-The script creates a local `.venv`, installs PyTorch with CUDA + all dependencies, and launches the Gradio server. Open the URL printed in the terminal (usually `http://127.0.0.1:7860`).
+The bootstrap script creates a local `.venv`, installs PyTorch with CUDA support, installs all other dependencies, and launches the Gradio server. Open the URL printed in the terminal (usually `http://127.0.0.1:7860`).
+
+After initial setup, use the quick launcher:
+
+```cmd
+launch.bat
+```
 
 ### Linux
 
 ```bash
 git clone https://github.com/sjfischr/cinderworks.git
 cd cinderworks/studio
-chmod +x install/bootstrap.sh
+chmod +x install/bootstrap.sh launch.sh
 ./install/bootstrap.sh
 ```
 
-### Quick Launch (after initial setup)
+After initial setup:
 
-```cmd
-cd cinderworks\studio
-launch.bat          # Windows
-./launch.sh         # Linux
+```bash
+./launch.sh
 ```
 
 ### Manual Setup
@@ -62,32 +66,31 @@ uv venv .venv --python python
 .venv\Scripts\activate        # Windows
 # source .venv/bin/activate   # Linux
 
-uv pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+uv pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128 --index-strategy unsafe-best-match
 uv pip install -r requirements.txt
 
 copy .env.example .env        # adjust paths if needed
 python app.py
 ```
 
+## Model Weights
+
+Cinderworks uses the `Krea2Pipeline` from diffusers for inference. The diffusers-format weights need to be downloaded once (~36 GB). The fastest method is via the HuggingFace CLI:
+
+```cmd
+hf download krea/Krea-2-Turbo --local-dir models_store/krea2-turbo-diffusers
+```
+
+If you skip this step, the pipeline will auto-download from HuggingFace on first generate (slower, unauthenticated rate limits apply).
+
+The in-app "Download Krea 2 Turbo" button downloads the Comfy-Org safetensors (used for readiness status checking). These are separate from the diffusers-format weights used for inference. A future update will consolidate to a single set.
+
 ## First Run
 
 1. **Launch** — the UI opens immediately (no model loading at startup).
-2. **Download model weights** — you have two options:
-   - **In-app:** Models tab → click "Download Krea 2 Turbo" (downloads Comfy-Org safetensors for readiness tracking)
-   - **CLI (faster with HF token):** `hf download krea/Krea-2-Turbo --local-dir models_store/krea2-turbo-diffusers`
-3. **Generate** — type a prompt, click Generate. First generation loads the pipeline (~30s), subsequent ones are fast.
-4. **History** — past generations are saved with full parameters for reproduction.
-
-## Model Weights
-
-The app uses the diffusers-format weights from `krea/Krea-2-Turbo` on HuggingFace (~36 GB). These can be:
-- Auto-downloaded on first generation (goes to HF cache at `~/.cache/huggingface/`)
-- Pre-downloaded to `models_store/krea2-turbo-diffusers/` via:
-  ```cmd
-  hf download krea/Krea-2-Turbo --local-dir models_store/krea2-turbo-diffusers
-  ```
-
-The in-app downloader downloads the Comfy-Org format safetensors (used for readiness status display).
+2. **Download models** — either via `hf download` (recommended, see above) or the pipeline auto-downloads on first generate.
+3. **Generate tab** → type a prompt, click Generate. First generation loads the pipeline (~30s), subsequent ones are faster.
+4. **History tab** → past generations are saved with full parameters for reproduction. You can load params from any past job or delete jobs.
 
 ## Configuration
 
@@ -108,15 +111,17 @@ All paths are relative to `studio/` unless absolute.
 studio/
 ├── app.py              # Gradio Blocks shell (thin — wiring only)
 ├── config.py           # Config from .env
-├── launch.bat/.sh      # Quick-start scripts
-├── requirements.txt    # Dependencies
+├── launch.bat          # Quick launch (Windows)
+├── launch.sh           # Quick launch (Linux)
+├── requirements.txt    # Dependencies (torch installed separately with CUDA)
+├── uv.toml             # uv package manager config (CUDA index)
 ├── .env.example        # Template config
 ├── core/
 │   ├── model_loader.py # Lazy loading, caches by (model_id, precision)
 │   ├── system_check.py # CUDA/model readiness detection
 │   └── vram_manager.py # Single-tenant GPU memory coordinator
 ├── db/
-│   └── db.py           # SQLite CRUD (job + artifact tables + delete)
+│   └── db.py           # SQLite CRUD (job + artifact tables, delete support)
 ├── models/
 │   ├── registry.py     # Model-agnostic routing layer
 │   ├── downloader.py   # Streaming, resumable HuggingFace downloads
@@ -131,6 +136,7 @@ studio/
 │   └── bootstrap.sh    # Linux one-click install + launch
 ├── tests/              # pytest + hypothesis (226 tests)
 ├── models_store/       # Downloaded model weights (git-ignored)
+│   └── krea2-turbo-diffusers/  # Diffusers-format weights (via hf download)
 └── outputs/            # Generated images (git-ignored)
 ```
 
@@ -141,16 +147,28 @@ cd cinderworks\studio
 ..\.venv\Scripts\python -m pytest tests/ -v
 ```
 
+Or from the repo root:
+
+```cmd
+.venv\Scripts\python -m pytest studio/tests/ -v
+```
+
 All tests run without a GPU — model operations are mocked when CUDA is unavailable.
 
 ## Architecture Decisions
 
 - **Shell stays thin** — `app.py` wires components. No inference, download, or SQL.
 - **Registry indirection** — UI never imports backends directly. Adding a model = one registry entry + one backend module.
-- **Diffusers pipeline** — real inference uses `Krea2Pipeline` with `model_cpu_offload()` for automatic VRAM management.
+- **Single GPU chokepoint** — only `vram_manager.py` coordinates GPU tenancy. The pipeline internally handles component offloading.
 - **Error boundary at UI** — handlers catch everything, log tracebacks to file, show plain-language messages to the user.
 - **Lazy loading** — models load on first generate, not on boot. UI is navigable in under 5 seconds.
-- **Turbo defaults** — 8 steps, guidance_scale=0.0 (disabled), mu/shift=1.15.
+- **Dual-path backend** — real inference (Krea2Pipeline + CUDA) or stub (no GPU, for tests). Auto-detected.
+
+## Known Limitations (Phase 1)
+
+- Diffusers-format weights and Comfy-Org safetensors are separate downloads (will be consolidated)
+- `Krea2Pipeline` is installed from diffusers `main` branch (not yet in a stable PyPI release)
+- bf16 precision requires ~24 GB VRAM (tight fit on RTX 4090 with other processes running)
 
 ## License
 
