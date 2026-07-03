@@ -70,9 +70,14 @@ fi
 
 echo "[Cinderworks] Installing pinned dependencies from requirements.txt..."
 
-# Install torch with CUDA support first (requires separate index)
+# Install torch with CUDA support first (requires separate index).
+# The +cu128 build tag is REQUIRED, not cosmetic: "torch==2.7.0" alone
+# matches both this CUDA build and any plain-PyPI CPU build with the
+# same version number (PEP 440 ignores local version tags in a bare
+# ==X.Y.Z match), so a bare version spec can silently resolve to the
+# wrong wheel once a PyPI fallback index is available (see uv.toml).
 echo "[Cinderworks] Installing PyTorch with CUDA support..."
-uv pip install --python "$VENV_DIR/bin/python" torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+uv pip install --python "$VENV_DIR/bin/python" torch==2.7.0+cu128 torchvision==0.22.0+cu128 --index-url https://download.pytorch.org/whl/cu128
 if [ $? -ne 0 ]; then
     echo "[Cinderworks] ERROR: Failed to install PyTorch with CUDA."
     exit 1
