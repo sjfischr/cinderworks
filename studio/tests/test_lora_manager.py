@@ -876,22 +876,23 @@ class TestSplitLoraKey:
 
 class TestNormalizeModulePath:
     def test_diffusers_passthrough(self):
+        """Genuine diffusers-layout paths pass through unchanged."""
         assert (
-            _normalize_module_path("transformer.blocks.0.attn.to_q", {})
-            == "transformer.blocks.0.attn.to_q"
+            _normalize_module_path("transformer.transformer_blocks.0.attn.to_q", {})
+            == "transformer.transformer_blocks.0.attn.to_q"
         )
 
     def test_comfyui_prefix_remapped(self):
         assert (
-            _normalize_module_path("diffusion_model.blocks.0.attn.to_q", {})
-            == "transformer.blocks.0.attn.to_q"
+            _normalize_module_path("diffusion_model.transformer_blocks.0.attn.to_q", {})
+            == "transformer.transformer_blocks.0.attn.to_q"
         )
 
     def test_kohya_flattened_resolved_via_model_map(self):
-        kohya_map = {"blocks_0_attn_to_q": "blocks.0.attn.to_q"}
+        kohya_map = {"transformer_blocks_0_attn_to_q": "transformer_blocks.0.attn.to_q"}
         assert (
-            _normalize_module_path("lora_unet_blocks_0_attn_to_q", kohya_map)
-            == "transformer.blocks.0.attn.to_q"
+            _normalize_module_path("lora_unet_transformer_blocks_0_attn_to_q", kohya_map)
+            == "transformer.transformer_blocks.0.attn.to_q"
         )
 
     def test_kohya_flattened_unresolvable_returns_none(self):
@@ -899,21 +900,108 @@ class TestNormalizeModulePath:
 
     def test_bare_module_path_gets_transformer_prefix(self):
         assert (
-            _normalize_module_path("blocks.0.attn.to_q", {})
-            == "transformer.blocks.0.attn.to_q"
+            _normalize_module_path("transformer_blocks.0.attn.to_q", {})
+            == "transformer.transformer_blocks.0.attn.to_q"
+        )
+
+
+class TestOriginalLayoutTranslation:
+    """The original Krea 2 checkpoint layout (wq/wk/wv/wo, attn.gate,
+    mlp.*, blocks.N) must be translated to the diffusers port's names
+    (to_q/to_k/to_v/to_out.0, to_gate, ff.*, transformer_blocks.N) —
+    the exact mismatch behind the field failure 'Target modules
+    {attn.gate, mlp.up, wo, wq, wv, wk, mlp.gate, mlp.down} not found
+    in the base model'."""
+
+    @pytest.mark.parametrize(
+        "original,expected",
+        [
+            ("blocks.0.attn.wq", "transformer_blocks.0.attn.to_q"),
+            ("blocks.0.attn.wk", "transformer_blocks.0.attn.to_k"),
+            ("blocks.0.attn.wv", "transformer_blocks.0.attn.to_v"),
+            ("blocks.0.attn.wo", "transformer_blocks.0.attn.to_out.0"),
+            ("blocks.0.attn.gate", "transformer_blocks.0.attn.to_gate"),
+            ("blocks.5.mlp.gate", "transformer_blocks.5.ff.gate"),
+            ("blocks.5.mlp.up", "transformer_blocks.5.ff.up"),
+            ("blocks.5.mlp.down", "transformer_blocks.5.ff.down"),
+        ],
+    )
+    def test_original_names_translated(self, original, expected):
+        from studio.core.lora_manager import _translate_original_layout
+
+        assert _translate_original_layout(original) == expected
+
+    def test_diffusers_names_untouched(self):
+        from studio.core.lora_manager import _translate_original_layout
+
+        for path in (
+            "transformer_blocks.0.attn.to_q",
+            "transformer_blocks.0.attn.to_out.0",
+            "transformer_blocks.0.ff.gate",
+        ):
+            assert _translate_original_layout(path) == path
+
+    def test_flat_original_names_translated(self):
+        from studio.core.lora_manager import _translate_original_layout_flat
+
+        assert (
+            _translate_original_layout_flat("blocks_0_attn_wq")
+            == "transformer_blocks_0_attn_to_q"
+        )
+        assert (
+            _translate_original_layout_flat("blocks_0_attn_wo")
+            == "transformer_blocks_0_attn_to_out_0"
+        )
+        assert (
+            _translate_original_layout_flat("blocks_3_mlp_down")
+            == "transformer_blocks_3_ff_down"
+        )
+
+    def test_comfyui_original_layout_end_to_end(self):
+        """diffusion_model.blocks.N.attn.wq → transformer.transformer_blocks.N.attn.to_q"""
+        assert (
+            _normalize_module_path("diffusion_model.blocks.0.attn.wq", {})
+            == "transformer.transformer_blocks.0.attn.to_q"
+        )
+
+    def test_kohya_flat_original_layout_resolved_via_model_map(self):
+        kohya_map = {
+            "transformer_blocks_0_attn_to_q": "transformer_blocks.0.attn.to_q"
+        }
+        assert (
+            _normalize_module_path("lora_unet_blocks_0_attn_wq", kohya_map)
+            == "transformer.transformer_blocks.0.attn.to_q"
+        )
+
+    def test_validation_rejects_paths_missing_from_model(self):
+        """With real_modules provided, an unresolvable path returns None
+        (unmatched) instead of reaching PEFT, which would hard-fail the
+        entire load with 'Target modules ... not found in the base model'."""
+        real_modules = {"transformer_blocks.0.attn.to_q"}
+        assert (
+            _normalize_module_path(
+                "diffusion_model.blocks.0.attn.wq", {}, real_modules
+            )
+            == "transformer.transformer_blocks.0.attn.to_q"
+        )
+        assert (
+            _normalize_module_path(
+                "diffusion_model.blocks.0.attn.made_up", {}, real_modules
+            )
+            is None
         )
 
 
 class TestConvertLoraStateDict:
     def test_comfyui_format_converted(self):
         sd = {
-            "diffusion_model.blocks.0.to_q.lora_down.weight": _FakeTensor((4, 16)),
-            "diffusion_model.blocks.0.to_q.lora_up.weight": _FakeTensor((16, 4)),
+            "diffusion_model.transformer_blocks.0.attn.to_q.lora_down.weight": _FakeTensor((4, 16)),
+            "diffusion_model.transformer_blocks.0.attn.to_q.lora_up.weight": _FakeTensor((16, 4)),
         }
         converted, unmatched, te_skipped = _convert_lora_state_dict(sd, {})
         assert set(converted) == {
-            "transformer.blocks.0.to_q.lora_A.weight",
-            "transformer.blocks.0.to_q.lora_B.weight",
+            "transformer.transformer_blocks.0.attn.to_q.lora_A.weight",
+            "transformer.transformer_blocks.0.attn.to_q.lora_B.weight",
         }
         assert unmatched == []
         assert te_skipped == 0
@@ -921,12 +1009,12 @@ class TestConvertLoraStateDict:
     def test_alpha_folded_into_lora_b(self):
         """alpha/rank scaling is folded into the up (lora_B) tensor."""
         sd = {
-            "diffusion_model.blocks.0.to_q.lora_down.weight": _FakeTensor((4, 16)),
-            "diffusion_model.blocks.0.to_q.lora_up.weight": _FakeTensor((16, 4), value=2.0),
-            "diffusion_model.blocks.0.to_q.alpha": _FakeTensor((), value=2.0),
+            "diffusion_model.transformer_blocks.0.attn.to_q.lora_down.weight": _FakeTensor((4, 16)),
+            "diffusion_model.transformer_blocks.0.attn.to_q.lora_up.weight": _FakeTensor((16, 4), value=2.0),
+            "diffusion_model.transformer_blocks.0.attn.to_q.alpha": _FakeTensor((), value=2.0),
         }
         converted, _, _ = _convert_lora_state_dict(sd, {})
-        lora_b = converted["transformer.blocks.0.to_q.lora_B.weight"]
+        lora_b = converted["transformer.transformer_blocks.0.attn.to_q.lora_B.weight"]
         # alpha=2.0, rank=4 -> scale 0.5; up value 2.0 * 0.5 = 1.0
         assert lora_b.value == pytest.approx(1.0)
         # No alpha keys leak into the converted dict
@@ -935,7 +1023,7 @@ class TestConvertLoraStateDict:
     def test_text_encoder_keys_skipped_not_unmatched(self):
         sd = {
             "lora_te_encoder_layers_0_q.lora_down.weight": _FakeTensor(),
-            "diffusion_model.blocks.0.to_q.lora_A.weight": _FakeTensor(),
+            "diffusion_model.transformer_blocks.0.attn.to_q.lora_A.weight": _FakeTensor(),
         }
         converted, unmatched, te_skipped = _convert_lora_state_dict(sd, {})
         assert te_skipped == 1
@@ -947,6 +1035,33 @@ class TestConvertLoraStateDict:
         converted, unmatched, _ = _convert_lora_state_dict(sd, {})
         assert converted == {}
         assert unmatched == ["totally.unrelated.weight"]
+
+    def test_original_layout_lora_converted_and_validated(self):
+        """End-to-end reproduction of the field failure: a musubi/ComfyUI
+        LoRA in the original Krea 2 layout converts fully to validated
+        diffusers module paths."""
+        sd = {}
+        for mod in ("attn.wq", "attn.wk", "attn.wv", "attn.wo", "attn.gate",
+                    "mlp.gate", "mlp.up", "mlp.down"):
+            sd[f"diffusion_model.blocks.0.{mod}.lora_down.weight"] = _FakeTensor((4, 16))
+            sd[f"diffusion_model.blocks.0.{mod}.lora_up.weight"] = _FakeTensor((16, 4))
+        real_modules = {
+            "transformer_blocks.0.attn.to_q",
+            "transformer_blocks.0.attn.to_k",
+            "transformer_blocks.0.attn.to_v",
+            "transformer_blocks.0.attn.to_out.0",
+            "transformer_blocks.0.attn.to_gate",
+            "transformer_blocks.0.ff.gate",
+            "transformer_blocks.0.ff.up",
+            "transformer_blocks.0.ff.down",
+        }
+        converted, unmatched, _ = _convert_lora_state_dict(sd, {}, real_modules)
+        assert unmatched == []
+        assert len(converted) == 16  # 8 modules x (lora_A + lora_B)
+        # Every emitted module path exists in the model
+        for key in converted:
+            path = key.removeprefix("transformer.").rsplit(".lora_", 1)[0]
+            assert path in real_modules
 
 
 class TestLoraFailureMessage:
