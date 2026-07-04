@@ -38,7 +38,7 @@ class RegistryEntry:
 
 
 # ---------------------------------------------------------------------------
-# Registry data — Phase 1: one entry only
+# Registry data
 # ---------------------------------------------------------------------------
 
 _REGISTRY: list[RegistryEntry] = [
@@ -58,6 +58,23 @@ _REGISTRY: list[RegistryEntry] = [
             # Keep in sync with DIT_VRAM_TIERS in backends/krea2.py.
             # bf16 transformer weights are 24.76 GiB — does not fit a
             # 24 GB card once the WDDM reserve is accounted for.
+            "bf16": 25_000_000_000,
+            "fp8_scaled": 13_000_000_000,
+        },
+    ),
+    RegistryEntry(
+        model_id="krea2-raw",
+        display_name="Krea 2 Raw",
+        backend_module="studio.models.backends.krea2",
+        checkpoints=[
+            "krea2_raw_fp8_scaled.safetensors",
+            "krea2_raw_bf16.safetensors",
+        ],
+        vae="qwen_image_vae.safetensors",
+        text_encoder="qwen3vl_4b_fp8_scaled.safetensors",
+        sampler_defaults={"steps": 28, "cfg": 4.5, "mu_shift": 1.15},
+        precision_options=["bf16", "fp8_scaled"],
+        vram_tiers={
             "bf16": 25_000_000_000,
             "fp8_scaled": 13_000_000_000,
         },
@@ -84,11 +101,32 @@ _unavailable_backends: dict[str, str] = {}
 
 
 def list_models() -> list[RegistryEntry]:
-    """Return all registered model entries.
-
-    Phase 1: returns exactly one entry (Krea 2 Turbo).
-    """
+    """Return all registered model entries."""
     return list(_REGISTRY)
+
+
+def list_checkpoint_options() -> list[dict[str, str]]:
+    """Return all model+precision combinations for the checkpoint selector.
+
+    Dynamically queries all registered entries — adding a new RegistryEntry
+    automatically surfaces its checkpoints without UI changes.
+
+    Returns:
+        A list of dicts, each with keys:
+        - model_id: The registry model identifier (e.g. 'krea2-turbo')
+        - precision: The precision variant (e.g. 'fp8_scaled', 'bf16')
+        - display_label: Human-readable label formatted as
+          "{display_name} {precision}" (e.g. "Krea 2 Turbo fp8_scaled")
+    """
+    options: list[dict[str, str]] = []
+    for entry in _REGISTRY:
+        for precision in entry.precision_options:
+            options.append({
+                "model_id": entry.model_id,
+                "precision": precision,
+                "display_label": f"{entry.display_name} {precision}",
+            })
+    return options
 
 
 def get_meta(model_id: str) -> RegistryEntry:

@@ -1,10 +1,15 @@
-"""Krea 2 Turbo Backend — real inference via diffusers Krea2Pipeline.
+"""Krea 2 Backend — real inference via diffusers Krea2Pipeline.
 
-Implements the full generation pipeline for Krea 2 Turbo using:
+Implements the full generation pipeline for Krea 2 using:
 - Krea2Pipeline from diffusers (handles text encoding, sampling, VAE decode)
 - Qwen3-VL-4B text encoder (12-layer hidden-state aggregation) — managed internally by pipeline
-- Krea 2 Turbo DiT (Euler flow sampling, 8 steps, CFG disabled)
+- Krea 2 DiT (Turbo: 8 steps, CFG 0.0 | Raw: 28 steps, CFG 4.5)
 - Qwen-Image VAE — managed internally by pipeline
+
+Supports multiple checkpoints (krea2-turbo, krea2-raw) via lazy switching:
+- Pipeline is cached per (model_id, precision, mode)
+- Checkpoint switch evicts prior pipeline, coordinating through VRAM_Manager
+- Sampler defaults are resolved from the registry per model_id
 
 All GPU moves go through vram_manager — nothing calls .to('cuda') directly.
 This module is importable without torch/CUDA (lazy imports inside functions).
@@ -81,10 +86,23 @@ DIT_VRAM_TIERS = {
 _ACTIVATION_BASELINE_BYTES = 2_000_000_000  # ~2 GB at 1024x1024, batch_size=1
 _ACTIVATION_REFERENCE_PIXELS = 1024 * 1024
 
-# HuggingFace model ID for Krea 2 Turbo (diffusers format)
+# HuggingFace model IDs and local directory names per checkpoint
+_MODEL_SOURCES: dict[str, dict[str, str]] = {
+    "krea2-turbo": {
+        "hf_id": "krea/Krea-2-Turbo",
+        "local_dir": "krea2-turbo-diffusers",
+    },
+    "krea2-raw": {
+        "hf_id": "krea/Krea-2-Raw",
+        "local_dir": "krea2-raw-diffusers",
+    },
+}
+
+# Backwards compat alias — tests and older code may reference this
 _HF_MODEL_ID = "krea/Krea-2-Turbo"
 
 # Module-level pipeline cache (loaded once on first generate, reused after)
+# Key format: "pipe:{model_id}:{precision}:{mode}"
 _pipeline_cache: dict[str, Any] = {}
 
 
@@ -125,8 +143,9 @@ class GenerationParams:
 def validate_params(params: dict[str, Any]) -> GenerationParams:
     """Validate and resolve generation parameters from a raw dict.
 
-    Applies Turbo_Defaults for omitted parameters. Rejects invalid values
-    with plain-language error messages.
+    Applies sampler defaults from the RegistryEntry for the selected model_id.
+    If no model_id is provided, defaults to 'krea2-turbo'. User-provided
+    values for steps, cfg, and mu_shift override the registry defaults.
 
     Args:
         params: Raw parameter dict from the UI/registry.
@@ -141,7 +160,21 @@ def validate_params(params: dict[str, Any]) -> GenerationParams:
     if not prompt or not prompt.strip():
         raise ValueError("A prompt is required — please enter a text description of the image you want to generate.")
 
-    steps = params.get("steps", TURBO_STEPS)
+    # Resolve model_id and its sampler defaults from the registry
+    model_id = params.get("model_id", "krea2-turbo")
+    try:
+        from studio.models.registry import get_meta
+        entry = get_meta(model_id)
+        default_steps = entry.sampler_defaults.get("steps", TURBO_STEPS)
+        default_cfg = entry.sampler_defaults.get("cfg", TURBO_CFG)
+        default_mu_shift = entry.sampler_defaults.get("mu_shift", TURBO_MU_SHIFT)
+    except (KeyError, ImportError):
+        # Fallback to Turbo defaults if registry lookup fails
+        default_steps = TURBO_STEPS
+        default_cfg = TURBO_CFG
+        default_mu_shift = TURBO_MU_SHIFT
+
+    steps = params.get("steps", default_steps)
     if not isinstance(steps, int) or steps < STEPS_MIN or steps > STEPS_MAX:
         raise ValueError(
             f"Steps must be an integer between {STEPS_MIN} and {STEPS_MAX}, got {steps}"
@@ -192,8 +225,8 @@ def validate_params(params: dict[str, Any]) -> GenerationParams:
             f"Batch count must be between {BATCH_COUNT_MIN} and {BATCH_COUNT_MAX}, got {batch_count}"
         )
 
-    cfg = params.get("cfg", TURBO_CFG)
-    mu_shift = params.get("mu_shift", TURBO_MU_SHIFT)
+    cfg = params.get("cfg", default_cfg)
+    mu_shift = params.get("mu_shift", default_mu_shift)
 
     return GenerationParams(
         prompt=prompt.strip(),
@@ -460,19 +493,25 @@ def _patch_krea2_gqa_attention() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False) -> Any:
+def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False, model_id: str = "krea2-turbo", vram_mgr: Any = None) -> Any:
     """Get or load the Krea2Pipeline at the requested precision (lazy, cached).
 
     On first call, loads from a local directory if available, otherwise
     falls back to downloading from HuggingFace. Subsequent calls with the
-    same precision and residency mode return the cached pipeline
-    immediately. The cache is keyed by (precision, mode) so switching
-    bf16 <-> fp8_scaled, or crossing the full-GPU-fit threshold, reloads
-    correctly.
+    same model_id, precision, and residency mode return the cached pipeline
+    immediately. The cache is keyed by (model_id, precision, mode) so
+    switching checkpoints, bf16 <-> fp8_scaled, or crossing the full-GPU-fit
+    threshold, reloads correctly.
+
+    Checkpoint switching: when a different model_id is requested, the prior
+    cached pipeline is evicted BEFORE the new one is loaded. This ensures
+    peak VRAM never holds both checkpoints simultaneously. When a vram_mgr
+    is provided, the old checkpoint's GPU memory is released through it
+    before loading the new one.
 
     Local path priority:
-    1. Config.MODEL_DIR / "krea2-turbo-diffusers" (pre-downloaded via `hf download`)
-    2. HuggingFace hub auto-download from "krea/Krea-2-Turbo"
+    1. Config.MODEL_DIR / "{local_dir}" (pre-downloaded via `hf download`)
+    2. HuggingFace hub auto-download from the model's HF ID
 
     Precision handling:
     - bf16: weights kept in bfloat16 (24.76 GiB transformer — does not fit
@@ -497,6 +536,14 @@ def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False
       call) but is the only way to run a working set that doesn't fit
       resident all at once.
 
+    Args:
+        precision: Model precision — 'bf16' or 'fp8_scaled'.
+        full_gpu_resident: Whether to load the full pipeline on GPU.
+        model_id: Which checkpoint to load (e.g. 'krea2-turbo', 'krea2-raw').
+        vram_mgr: Optional VRAMManager for coordinated VRAM release on
+            checkpoint switch. When provided, any currently-resident dit
+            tenant is released before evicting the old pipeline.
+
     Returns:
         A loaded Krea2Pipeline instance ready for inference.
 
@@ -504,15 +551,31 @@ def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False
         RuntimeError: If the pipeline cannot be loaded.
     """
     mode = "gpu" if full_gpu_resident else "offload"
-    cache_key = f"pipe:{precision}:{mode}"
+    cache_key = f"pipe:{model_id}:{precision}:{mode}"
     if cache_key in _pipeline_cache:
         return _pipeline_cache[cache_key]
 
     # Evict any other cached pipeline so we don't hold two full weight
-    # sets in system RAM (different precision or residency mode).
-    for stale_key in [k for k in _pipeline_cache if k.startswith("pipe:")]:
-        log.info("Evicting cached pipeline '%s' (precision/mode change)", stale_key)
-        del _pipeline_cache[stale_key]
+    # sets in system RAM (different model_id, precision, or residency mode).
+    # This ensures peak VRAM never holds both checkpoints simultaneously.
+    stale_keys = [k for k in _pipeline_cache if k.startswith("pipe:")]
+    if stale_keys:
+        # Coordinate with VRAM manager: release the old checkpoint's GPU
+        # memory BEFORE loading the new one. This guarantees peak VRAM
+        # never holds both checkpoints simultaneously (Requirement 3.7, 8.3).
+        if vram_mgr is not None and vram_mgr.resident is not None:
+            log.info(
+                "Checkpoint switch: releasing VRAM tenant '%s' before evicting "
+                "old pipeline and loading model_id='%s'",
+                vram_mgr.resident.name,
+                model_id,
+            )
+            vram_mgr.release(vram_mgr.resident)
+
+        for stale_key in stale_keys:
+            log.info("Evicting cached pipeline '%s' (checkpoint/precision/mode change)", stale_key)
+            del _pipeline_cache[stale_key]
+
     import gc
 
     gc.collect()
@@ -521,17 +584,22 @@ def _get_pipeline(precision: str = "fp8_scaled", full_gpu_resident: bool = False
     from diffusers import Krea2Pipeline
     from studio.config import Config
 
-    # Check for local diffusers-format weights first
-    local_path = Config.MODEL_DIR / "krea2-turbo-diffusers"
+    # Resolve model source (local path or HuggingFace ID)
+    model_source_info = _MODEL_SOURCES.get(model_id, _MODEL_SOURCES["krea2-turbo"])
+    local_dir_name = model_source_info["local_dir"]
+    hf_model_id = model_source_info["hf_id"]
+
+    local_path = Config.MODEL_DIR / local_dir_name
     if local_path.is_dir() and (local_path / "model_index.json").is_file():
-        log.info("Loading Krea2Pipeline from local path: %s", local_path)
+        log.info("Loading Krea2Pipeline from local path: %s (model_id=%s)", local_path, model_id)
         source = str(local_path)
     else:
         log.info(
-            "Loading Krea2Pipeline from '%s' (first use — this may download ~36 GB)",
-            _HF_MODEL_ID,
+            "Loading Krea2Pipeline from '%s' (model_id=%s, first use — this may download ~36 GB)",
+            hf_model_id,
+            model_id,
         )
-        source = _HF_MODEL_ID
+        source = hf_model_id
 
     try:
         log.info(
@@ -699,11 +767,20 @@ def _unpark_text_encoder(pipe: Any) -> None:
 
 
 def generate(params: dict[str, Any]) -> Generator[str | dict, None, None]:
-    """Generate images using Krea 2 Turbo.
+    """Generate images using Krea 2 (Turbo or Raw).
 
     This is the main entry point called by the registry. It uses
     Krea2Pipeline from diffusers for the full inference sequence:
     text encoding → sampling → VAE decoding.
+
+    Supports both txt2img and img2img modes:
+    - txt2img (default): generate from noise using prompt only
+    - img2img: when params["init_image_path"] is present, encode the init
+      image to latent space, add noise at the level determined by
+      params["denoise_strength"] (0.0–1.0), and sample from that noised
+      latent. Special cases:
+        - denoise_strength=0.0: return init image unchanged (no sampling)
+        - denoise_strength=1.0: full sampling from noise using init image dims
 
     The function is a generator that yields:
     - Progress strings (encoding, sampling steps, decoding)
@@ -745,7 +822,19 @@ def generate(params: dict[str, Any]) -> Generator[str | dict, None, None]:
 
     vram_mgr: VRAMManager = params.get("_vram_manager") or get_vram_manager()
 
-    # --- 4. Check if we're in test/mock mode ---
+    # --- 4. Img2img early return: denoise_strength=0.0 ---
+    # When denoise_strength is exactly 0.0, return the init image unchanged
+    # without running any pipeline (Requirement 4.5).
+    init_image_path = params.get("init_image_path")
+    denoise_strength = params.get("denoise_strength", 0.5)
+
+    if init_image_path is not None and denoise_strength == 0.0:
+        yield from _img2img_passthrough(
+            init_image_path, gen_params, base_seed, params
+        )
+        return
+
+    # --- 5. Check if we're in test/mock mode ---
     # If no CUDA is available or _mock_inference is set, use the lightweight
     # stub path so tests work without GPU/model weights.
     use_real_inference = params.get("_real_inference", None)
@@ -761,6 +850,73 @@ def generate(params: dict[str, Any]) -> Generator[str | dict, None, None]:
         yield from _generate_real(gen_params, base_seed, vram_mgr, params)
     else:
         yield from _generate_stub(gen_params, base_seed, vram_mgr, params)
+
+
+# ---------------------------------------------------------------------------
+# Img2Img Passthrough (denoise_strength=0.0 — return init image unchanged)
+# ---------------------------------------------------------------------------
+
+
+def _img2img_passthrough(
+    init_image_path: str,
+    gen_params: GenerationParams,
+    base_seed: int,
+    raw_params: dict[str, Any],
+) -> Generator[str | dict, None, None]:
+    """Return the init image unchanged when denoise_strength is 0.0.
+
+    No sampling, no pipeline load — just copy the init image to the output
+    directory and yield the result in the standard format (Requirement 4.5).
+    """
+    import shutil
+    from studio.config import Config
+
+    yield "Denoise strength 0.0 — returning init image unchanged..."
+
+    src_path = Path(init_image_path)
+    if not src_path.is_file():
+        raise ValueError(
+            f"Init image not found: {init_image_path} — the file may have "
+            f"been deleted."
+        )
+
+    # Copy init image to output directory with standard naming
+    output_path = Config.OUTPUT_DIR / f"krea2_{base_seed}" / "0000.png"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(str(src_path), str(output_path))
+    log.info("Img2img passthrough (denoise=0.0): copied %s → %s", src_path, output_path)
+
+    passthrough_params: dict[str, Any] = {
+        "prompt": gen_params.prompt,
+        "steps": gen_params.steps,
+        "cfg": gen_params.cfg,
+        "mu_shift": gen_params.mu_shift,
+        "width": gen_params.width,
+        "height": gen_params.height,
+        "precision": gen_params.precision,
+        "batch_size": gen_params.batch_size,
+        "batch_count": gen_params.batch_count,
+        "seed": base_seed,
+        "model_id": raw_params.get("model_id", "krea2-turbo"),
+        "denoise_strength": 0.0,
+        "init_image_path": init_image_path,
+    }
+    # Include mask_path when applicable (inpainting)
+    mask_path = raw_params.get("mask_path")
+    if mask_path is not None:
+        passthrough_params["mask_path"] = mask_path
+    # Include lora_stack when applicable
+    lora_stack = raw_params.get("lora_stack")
+    if lora_stack:
+        passthrough_params["lora_stack"] = lora_stack
+
+    yield {
+        "images": [output_path],
+        "seeds": [base_seed],
+        "base_seed": base_seed,
+        "params": passthrough_params,
+        "total_images": 1,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -854,10 +1010,12 @@ def _generate_real(
     )
 
     pipeline_ref: dict[str, Any] = {"pipe": None}
+    # Resolve model_id for checkpoint selection — defaults to krea2-turbo
+    _model_id = raw_params.get("model_id", "krea2-turbo")
 
     def _load_text_encoder() -> None:
         # First acquire also loads the pipeline itself (lazy).
-        pipeline_ref["pipe"] = _get_pipeline(gen_params.precision, full_gpu_resident)
+        pipeline_ref["pipe"] = _get_pipeline(gen_params.precision, full_gpu_resident, model_id=_model_id, vram_mgr=vram_mgr)
         if full_gpu_resident:
             _unpark_text_encoder(pipeline_ref["pipe"])
         # In offload mode the accelerate hooks own placement — nothing to do.
@@ -890,7 +1048,7 @@ def _generate_real(
     vram_mgr.acquire(text_encoder_tenant)
 
     yield "Loading pipeline..."
-    pipe = _get_pipeline(gen_params.precision, full_gpu_resident)
+    pipe = _get_pipeline(gen_params.precision, full_gpu_resident, model_id=_model_id, vram_mgr=vram_mgr)
 
     yield "Encoding prompt..."
     encode_device = torch.device("cuda") if full_gpu_resident else None
@@ -935,6 +1093,69 @@ def _generate_real(
     image_index = 0
 
     from studio.config import Config
+
+    # --- Img2img latent preparation ---
+    # When init_image_path is present, encode the init image to latents and
+    # add noise proportional to denoise_strength. For denoise_strength=1.0,
+    # we ignore the init image content (full sampling from noise) but still
+    # use its dimensions. denoise_strength=0.0 is handled earlier in generate().
+    init_image_path = raw_params.get("init_image_path")
+    denoise_strength = raw_params.get("denoise_strength", 0.5)
+    init_latents = None  # Will be set if img2img with 0 < denoise < 1
+    img2img_steps = gen_params.steps  # May be reduced for partial denoising
+
+    if init_image_path is not None and denoise_strength < 1.0:
+        # Encode init image to latent space using the pipeline's VAE
+        from PIL import Image as PILImage
+
+        yield "Encoding init image to latent space..."
+        init_img = PILImage.open(init_image_path).convert("RGB")
+        # Resize to target dimensions if needed
+        if init_img.size != (gen_params.width, gen_params.height):
+            init_img = init_img.resize(
+                (gen_params.width, gen_params.height), PILImage.LANCZOS
+            )
+
+        with torch.inference_mode():
+            # Convert image to tensor: [0,255] → [0,1] → [-1,1]
+            import torchvision.transforms.functional as TF
+
+            img_tensor = TF.to_tensor(init_img).unsqueeze(0).to(
+                device=pipe.vae.device, dtype=pipe.vae.dtype
+            )
+            img_tensor = 2.0 * img_tensor - 1.0  # Normalize to [-1, 1]
+
+            # Encode to latent space
+            latent_dist = pipe.vae.encode(img_tensor)
+            # Handle both DiagonalGaussianDistribution and plain tensor outputs
+            if hasattr(latent_dist, "latent_dist"):
+                init_latents = latent_dist.latent_dist.sample()
+            elif hasattr(latent_dist, "sample"):
+                init_latents = latent_dist.sample()
+            else:
+                init_latents = latent_dist
+
+            # Apply VAE scaling factor if available
+            if hasattr(pipe.vae, "config") and hasattr(pipe.vae.config, "scaling_factor"):
+                init_latents = init_latents * pipe.vae.config.scaling_factor
+
+        # Determine how many steps to run: denoise_strength controls what
+        # fraction of the full schedule we execute. Lower denoise = fewer steps.
+        img2img_steps = max(1, int(gen_params.steps * denoise_strength))
+        log.info(
+            "Img2img: denoise_strength=%.2f, running %d/%d steps from noised latents",
+            denoise_strength, img2img_steps, gen_params.steps,
+        )
+
+    elif init_image_path is not None and denoise_strength == 1.0:
+        # denoise_strength=1.0: full sampling from noise, but use init image
+        # dimensions. The generate() already validated width/height from params,
+        # and the caller is expected to set width/height to match the init image.
+        log.info(
+            "Img2img: denoise_strength=1.0, full sampling from noise "
+            "using init image dimensions (%dx%d)",
+            gen_params.width, gen_params.height,
+        )
 
     # Sentinel for the progress queue
     _DONE = object()
@@ -1008,19 +1229,42 @@ def _generate_real(
                 with sdpa_kernel(
                     [SDPBackend.FLASH_ATTENTION, SDPBackend.EFFICIENT_ATTENTION]
                 ):
-                    outcome["result"] = pipe(
+                    # Build kwargs for the pipeline call. In img2img mode with
+                    # 0 < denoise < 1, pass the noised init latents and use the
+                    # reduced step count. For txt2img or denoise=1.0, standard call.
+                    pipe_kwargs = dict(
                         prompt_embeds=prompt_embeds,
                         prompt_embeds_mask=prompt_embeds_mask,
                         negative_prompt_embeds=negative_embeds,
                         negative_prompt_embeds_mask=negative_embeds_mask,
                         height=gen_params.height,
                         width=gen_params.width,
-                        num_inference_steps=gen_params.steps,
+                        num_inference_steps=img2img_steps,
                         guidance_scale=gen_params.cfg,
                         num_images_per_prompt=gen_params.batch_size,
                         generator=generators if len(generators) > 1 else generators[0],
                         callback_on_step_end=_step_callback,
                     )
+                    if init_latents is not None:
+                        # Img2img: expand latents to batch_size and add noise
+                        # at the appropriate level for the denoise_strength.
+                        batch_latents = init_latents.expand(
+                            gen_params.batch_size, -1, -1, -1
+                        ).clone()
+
+                        # Use the scheduler to add noise at the right timestep.
+                        # The timestep corresponds to where in the schedule we
+                        # start denoising from.
+                        pipe.scheduler.set_timesteps(img2img_steps)
+                        noise = torch.randn_like(batch_latents)
+                        # Start from the first timestep in the (truncated) schedule
+                        timestep = pipe.scheduler.timesteps[0]
+                        batch_latents = pipe.scheduler.add_noise(
+                            batch_latents, noise, timestep
+                        )
+                        pipe_kwargs["latents"] = batch_latents
+
+                    outcome["result"] = pipe(**pipe_kwargs)
                 _log_vram_snapshot(f"after sampling batch {batch_num + 1}")
             except Exception as exc:  # noqa: BLE001 — re-raised on main thread
                 outcome["error"] = exc
@@ -1087,25 +1331,52 @@ def _generate_real(
 
     _log_vram_snapshot("after decode/save")
 
+    # --- Inpainting mask composite (Requirements 5.5, 5.6, 5.8) ---
+    # After generation, composite: unmasked pixels come from init image
+    # pixel-for-pixel, masked pixels come from the generated output.
+    # When no mask is provided, the entire image is the denoised region
+    # (standard img2img behavior — no composite needed).
+    mask_path = raw_params.get("mask_path")
+    if mask_path is not None and init_image_path is not None:
+        from studio.core.image_utils import apply_mask_composite
+
+        yield "Applying inpainting mask composite..."
+        for img_path in all_images:
+            apply_mask_composite(img_path, init_image_path, mask_path)
+
     vram_mgr.release(dit_tenant)
 
     # --- Final result ---
+    result_params = {
+        "prompt": gen_params.prompt,
+        "steps": gen_params.steps,
+        "cfg": gen_params.cfg,
+        "mu_shift": gen_params.mu_shift,
+        "width": gen_params.width,
+        "height": gen_params.height,
+        "precision": gen_params.precision,
+        "batch_size": gen_params.batch_size,
+        "batch_count": gen_params.batch_count,
+        "seed": base_seed,
+        "model_id": _model_id,
+    }
+    # Include img2img params when applicable
+    if init_image_path is not None:
+        result_params["denoise_strength"] = denoise_strength
+        result_params["init_image_path"] = init_image_path
+    # Include mask_path when applicable (inpainting)
+    if mask_path is not None:
+        result_params["mask_path"] = mask_path
+    # Include lora_stack when applicable
+    lora_stack = raw_params.get("lora_stack")
+    if lora_stack:
+        result_params["lora_stack"] = lora_stack
+
     yield {
         "images": all_images,
         "seeds": all_seeds,
         "base_seed": base_seed,
-        "params": {
-            "prompt": gen_params.prompt,
-            "steps": gen_params.steps,
-            "cfg": gen_params.cfg,
-            "mu_shift": gen_params.mu_shift,
-            "width": gen_params.width,
-            "height": gen_params.height,
-            "precision": gen_params.precision,
-            "batch_size": gen_params.batch_size,
-            "batch_count": gen_params.batch_count,
-            "seed": base_seed,
-        },
+        "params": result_params,
         "total_images": gen_params.total_images,
     }
 
@@ -1125,12 +1396,24 @@ def _generate_stub(
 
     Follows the same acquire/release sequence as real inference to
     maintain test compatibility (encode→offload→sample→decode order).
+    Supports img2img mode: when init_image_path is in raw_params,
+    simulates latent encoding and runs reduced steps per denoise_strength.
     """
     from studio.core.vram_manager import Tenant
 
     all_images: list[Path] = []
     all_seeds: list[int] = []
     image_index = 0
+
+    # --- Img2img state ---
+    init_image_path = raw_params.get("init_image_path")
+    denoise_strength = raw_params.get("denoise_strength", 0.5)
+
+    # Determine effective steps: for img2img with 0 < denoise < 1,
+    # only run a fraction of the full schedule.
+    effective_steps = gen_params.steps
+    if init_image_path is not None and denoise_strength < 1.0:
+        effective_steps = max(1, int(gen_params.steps * denoise_strength))
 
     for batch_num in range(gen_params.batch_count):
         # --- Text encoding (stub) ---
@@ -1160,6 +1443,10 @@ def _generate_stub(
         embeddings = {"type": "text_embedding", "prompt": gen_params.prompt, "layers": ENCODER_LAYERS}
         vram_mgr.release(text_encoder_tenant)
 
+        # --- Img2img latent encoding (stub) ---
+        if init_image_path is not None and denoise_strength < 1.0:
+            yield "Encoding init image to latent space..."
+
         # --- Diffusion sampling (stub) ---
         dit_model = None
 
@@ -1182,42 +1469,74 @@ def _generate_stub(
 
         vram_mgr.acquire(dit_tenant)
 
-        # Simulate sampling steps
-        for step in range(gen_params.steps):
-            yield f"Sampling step {step + 1}/{gen_params.steps}"
+        # Simulate sampling steps (reduced for img2img partial denoising)
+        for step in range(effective_steps):
+            yield f"Sampling step {step + 1}/{effective_steps}"
 
         vram_mgr.release(dit_tenant)
 
         # --- VAE decoding (stub) ---
         yield f"Decoding... (batch {batch_num + 1}/{gen_params.batch_count})"
 
-        # --- Save images (stub — create placeholder paths) ---
+        # --- Save images (stub — create placeholder PNG files) ---
         from studio.config import Config
+        from PIL import Image as PILImage
 
         for i in range(gen_params.batch_size):
             img_seed = base_seed + image_index
             output_path = Config.OUTPUT_DIR / f"krea2_{base_seed}" / f"{image_index:04d}.png"
             output_path.parent.mkdir(parents=True, exist_ok=True)
+            # Create an actual stub image so downstream compositing works
+            stub_img = PILImage.new("RGB", (gen_params.width, gen_params.height), color=(128, 128, 128))
+            stub_img.save(output_path)
             all_images.append(output_path)
             all_seeds.append(img_seed)
             image_index += 1
 
+    # --- Inpainting mask composite (Requirements 5.5, 5.6, 5.8) ---
+    # After generation, composite: unmasked pixels come from init image
+    # pixel-for-pixel, masked pixels come from the generated output.
+    # When no mask is provided, the entire image is the denoised region
+    # (standard img2img behavior — no composite needed).
+    mask_path = raw_params.get("mask_path")
+    if mask_path is not None and init_image_path is not None:
+        from studio.core.image_utils import apply_mask_composite
+
+        yield "Applying inpainting mask composite..."
+        for img_path in all_images:
+            apply_mask_composite(img_path, init_image_path, mask_path)
+
     # --- Final result ---
+    result_params = {
+        "prompt": gen_params.prompt,
+        "steps": gen_params.steps,
+        "cfg": gen_params.cfg,
+        "mu_shift": gen_params.mu_shift,
+        "width": gen_params.width,
+        "height": gen_params.height,
+        "precision": gen_params.precision,
+        "batch_size": gen_params.batch_size,
+        "batch_count": gen_params.batch_count,
+        "seed": base_seed,
+        "model_id": raw_params.get("model_id", "krea2-turbo"),
+    }
+    # Include img2img params when applicable
+    if init_image_path is not None:
+        result_params["denoise_strength"] = denoise_strength
+        result_params["init_image_path"] = init_image_path
+    # Include mask_path when applicable (inpainting)
+    mask_path = raw_params.get("mask_path")
+    if mask_path is not None:
+        result_params["mask_path"] = mask_path
+    # Include lora_stack when applicable
+    lora_stack = raw_params.get("lora_stack")
+    if lora_stack:
+        result_params["lora_stack"] = lora_stack
+
     yield {
         "images": all_images,
         "seeds": all_seeds,
         "base_seed": base_seed,
-        "params": {
-            "prompt": gen_params.prompt,
-            "steps": gen_params.steps,
-            "cfg": gen_params.cfg,
-            "mu_shift": gen_params.mu_shift,
-            "width": gen_params.width,
-            "height": gen_params.height,
-            "precision": gen_params.precision,
-            "batch_size": gen_params.batch_size,
-            "batch_count": gen_params.batch_count,
-            "seed": base_seed,
-        },
+        "params": result_params,
         "total_images": gen_params.total_images,
     }

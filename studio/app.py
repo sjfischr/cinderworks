@@ -4,7 +4,7 @@ Thin shell that wires Gradio UI components to handlers. Contains NO
 inference logic, no download logic, no SQL, no direct backend imports.
 All model access goes through the registry (via handlers).
 
-Implements: Requirements 1.4, 2.1, 2.4, 4.2, 8.3, 8.4, 8.5, 8.6, 9.1, 10.1
+Implements: Requirements 1.4, 2.1, 2.4, 3.1, 3.4, 3.8, 4.1, 4.2, 8.3, 8.4, 8.5, 8.6, 9.1, 10.1
 """
 
 from __future__ import annotations
@@ -31,6 +31,7 @@ import gradio as gr
 
 from studio.ui.theme import CUSTOM_CSS, get_theme
 from studio.ui import controls, handlers
+from studio.ui.gallery import create_gallery_with_actions
 from studio.core import system_check
 
 
@@ -194,10 +195,33 @@ def build_app() -> gr.Blocks:
                             value="",
                             elem_id="precision-warning",
                         )
+
+                        # --- Checkpoint Selector (Requirement 3.1) ---
+                        checkpoint_selector = controls.create_checkpoint_selector()
+
                         batch_size, batch_count = controls.create_batch_controls()
+
+                        # --- LoRA Panel (Requirements 2.1, 2.2) ---
+                        with gr.Accordion("LoRA Stack", open=False):
+                            (
+                                lora_dropdown,
+                                lora_weight_slider,
+                                lora_add_btn,
+                                lora_refresh_btn,
+                                lora_stack_display,
+                                lora_stack_state,
+                            ) = controls.create_lora_panel()
+                            # Status message for LoRA operations
+                            lora_status_msg = gr.Textbox(
+                                value="",
+                                visible=False,
+                                label="LoRA Status",
+                            )
+
                         generate_btn = gr.Button(
                             "Generate", variant="primary", size="lg"
                         )
+
                     with gr.Column(scale=3):
                         progress_output = gr.Textbox(
                             label="Progress",
@@ -205,11 +229,57 @@ def build_app() -> gr.Blocks:
                             lines=3,
                             placeholder="Generation progress will appear here...",
                         )
-                        image_gallery = gr.Gallery(
-                            label="Results",
-                            columns=2,
-                            height="auto",
+
+                        # --- Gallery with send-to actions (Requirement 9.1) ---
+                        (
+                            image_gallery,
+                            send_to_img2img_btn,
+                            send_to_upscale_btn,
+                            gallery_selected_state,
+                        ) = create_gallery_with_actions()
+
+                        # Status/feedback for send-to actions
+                        send_to_status = gr.Textbox(
+                            label="Action Status",
+                            interactive=False,
+                            lines=1,
+                            placeholder="",
                         )
+
+                # =============================================================
+                # IMG2IMG SECTION (inside Generate tab, as Accordion)
+                # =============================================================
+                with gr.Accordion("Image-to-Image / Inpainting", open=False) as img2img_accordion:
+                    with gr.Row():
+                        with gr.Column(scale=2):
+                            (
+                                img2img_init_image,
+                                img2img_denoise,
+                                img2img_mask_editor,
+                                img2img_prompt,
+                                img2img_steps,
+                                img2img_seed,
+                                img2img_width,
+                                img2img_height,
+                                img2img_precision,
+                            ) = controls.create_img2img_controls()
+
+                            img2img_generate_btn = gr.Button(
+                                "Generate (img2img)", variant="primary", size="lg"
+                            )
+
+                        with gr.Column(scale=3):
+                            img2img_progress = gr.Textbox(
+                                label="Img2Img Progress",
+                                interactive=False,
+                                lines=3,
+                                placeholder="Img2img generation progress will appear here...",
+                            )
+                            img2img_gallery = gr.Gallery(
+                                label="Img2Img Results",
+                                columns=2,
+                                height="auto",
+                            )
 
             # =============================================================
             # HISTORY TAB
@@ -337,7 +407,9 @@ def build_app() -> gr.Blocks:
         # EVENT WIRING
         # -----------------------------------------------------------------
 
-        # Generate button -> on_generate handler
+        # === Txt2Img Generate button ===
+        # Passes checkpoint_id and lora_stack_json to on_generate
+        # so that model_id + precision are stored in the job record (Req 3.8)
         generate_btn.click(
             fn=handlers.on_generate,
             inputs=[
@@ -349,19 +421,68 @@ def build_app() -> gr.Blocks:
                 precision,
                 batch_size,
                 batch_count,
+                lora_stack_state,
+                checkpoint_selector,
             ],
             outputs=[progress_output, image_gallery],
         )
 
-        # Precision picker -> advisory VRAM warning (hard refusal still
-        # happens at generate time; this warns before the click)
+        # === Img2Img Generate button ===
+        # Wires on_generate_img2img handler with all img2img controls
+        img2img_generate_btn.click(
+            fn=handlers.on_generate_img2img,
+            inputs=[
+                img2img_prompt,
+                img2img_steps,
+                img2img_seed,
+                img2img_width,
+                img2img_height,
+                img2img_precision,
+                img2img_init_image,
+                img2img_denoise,
+                img2img_mask_editor,
+                lora_stack_state,
+                checkpoint_selector,
+            ],
+            outputs=[img2img_progress, img2img_gallery],
+        )
+
+        # === LoRA Panel Wiring ===
+        # Add LoRA button → on_add_lora handler
+        lora_add_btn.click(
+            fn=handlers.on_add_lora,
+            inputs=[lora_dropdown, lora_weight_slider, lora_stack_state],
+            outputs=[lora_stack_state, lora_status_msg, lora_stack_display],
+        )
+
+        # === Gallery Send-To Actions ===
+        # "Send to img2img" button → populate img2img init image
+        send_to_img2img_btn.click(
+            fn=handlers.on_send_to_img2img,
+            inputs=[gallery_selected_state],
+            outputs=[img2img_init_image, send_to_status],
+        )
+
+        # "Send to Upscale" button → immediate upscale pipeline
+        send_to_upscale_btn.click(
+            fn=handlers.on_send_to_upscale,
+            inputs=[gallery_selected_state],
+            outputs=[upscale_output, send_to_status],
+        )
+
+        # === Checkpoint Selector ===
+        # Selection change does NOT trigger immediate reload (Req 3.4).
+        # The value is simply read at generation time from the component.
+        # No event wiring needed — Gradio reads the current value as an input.
+
+        # === Precision picker → advisory VRAM warning ===
         precision.change(
             fn=handlers.on_precision_change,
             inputs=[precision],
             outputs=[precision_warning],
         )
 
-        # Check Status button -> refresh model status display
+        # === Check Status button → refresh model status display ===
         def _get_model_status_text():
             """Return markdown showing per-file model download state."""
             from studio.models import downloader
@@ -373,7 +494,7 @@ def build_app() -> gr.Blocks:
             outputs=[model_status_display],
         )
 
-        # Download button -> on_download handler (generator streams progress)
+        # === Download button → on_download handler ===
         # After download completes, re-evaluate readiness and update banner + model status
         def _refresh_after_download():
             """Re-evaluate readiness and return updated banner + model status."""
@@ -405,14 +526,15 @@ def build_app() -> gr.Blocks:
             outputs=[download_progress],
         )
 
-        # Upscale an image
+        # Upscale an image (from the Upscale tab)
         upscale_btn.click(
             fn=handlers.on_upscale,
             inputs=[upscale_input, upscale_method, upscale_scale],
             outputs=[upscale_output, upscale_status],
         )
 
-        # History: auto-load first page when tab is selected
+        # === History Tab Wiring ===
+        # Auto-load first page when tab is selected
         _history_outputs = [
             history_display,
             history_page_state,

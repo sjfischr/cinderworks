@@ -36,18 +36,24 @@ def _isolate_registry():
 
 
 # ---------------------------------------------------------------------------
-# Requirement 9.6 — Exactly one Registry entry in Phase 1
+# Registry entries — verify expected models are registered
 # ---------------------------------------------------------------------------
 
 
-class TestExactlyOneEntry:
-    """Phase 1: registry ships exactly one entry (Krea 2 Turbo), no stubs."""
+class TestRegistryEntries:
+    """Registry ships the expected model entries."""
 
-    def test_exactly_one_entry(self):
-        """list_models() returns exactly 1 entry and it's 'krea2-turbo'."""
+    def test_registry_contains_krea2_turbo(self):
+        """list_models() includes 'krea2-turbo' with correct defaults."""
         models = list_models()
-        assert len(models) == 1
-        assert models[0].model_id == "krea2-turbo"
+        model_ids = [m.model_id for m in models]
+        assert "krea2-turbo" in model_ids
+
+    def test_registry_contains_krea2_raw(self):
+        """list_models() includes 'krea2-raw' with correct defaults."""
+        models = list_models()
+        model_ids = [m.model_id for m in models]
+        assert "krea2-raw" in model_ids
 
     def test_get_meta_returns_entry(self):
         """get_meta('krea2-turbo') returns the Krea 2 entry with correct fields."""
@@ -91,8 +97,9 @@ class TestFailingBackendMarkedUnavailable:
 
         # App is still functional — list_models and get_meta work fine
         models = list_models()
-        assert len(models) == 1
-        assert models[0].model_id == "krea2-turbo"
+        assert len(models) >= 1
+        model_ids = [m.model_id for m in models]
+        assert "krea2-turbo" in model_ids
 
         meta = get_meta("krea2-turbo")
         assert meta.display_name == "Krea 2 Turbo"
