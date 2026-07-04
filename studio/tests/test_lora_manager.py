@@ -784,3 +784,183 @@ class TestUnloadLoras:
         pipeline.load_lora_weights.assert_called_once()
         pipeline.set_adapters.assert_called_once()
         pipeline.unload_lora_weights.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# Forge-Neo-style loading behavior tests (key conversion, adapter names,
+# failure messages)
+# ---------------------------------------------------------------------------
+
+
+from studio.core.lora_manager import (  # noqa: E402
+    _convert_lora_state_dict,
+    _lora_failure_message,
+    _normalize_module_path,
+    _sanitize_adapter_name,
+    _split_lora_key,
+)
+
+
+class _FakeTensor:
+    """Minimal stand-in for a torch tensor (no torch in the test env)."""
+
+    def __init__(self, shape=(8, 4), value=1.0):
+        self.shape = shape
+        self.ndim = len(shape)
+        self.value = value
+
+    def __mul__(self, scalar):
+        return _FakeTensor(self.shape, self.value * scalar)
+
+    def __float__(self):
+        return float(self.value)
+
+
+class TestSanitizeAdapterName:
+    def test_plain_name_unchanged(self):
+        assert _sanitize_adapter_name("lora_0_style_anime") == "lora_0_style_anime"
+
+    def test_dots_replaced(self):
+        """Dots would crash torch ModuleDict — must be replaced."""
+        assert _sanitize_adapter_name("lora_0_detail-v1.5") == "lora_0_detail_v1_5"
+
+    def test_applied_during_load(self):
+        """apply_loras passes a sanitized adapter name to the pipeline."""
+        pipeline = MagicMock()
+        vram_mgr = VRAMManager(total_vram=24_000_000_000)
+        stack = LoRAStack(
+            entries=[
+                LoRAEntry(
+                    file_path=Path("/loras/style.v1.0.safetensors"),
+                    filename="style.v1.0",
+                    weight=1.0,
+                )
+            ]
+        )
+
+        apply_loras(pipeline, stack, vram_manager=vram_mgr)
+
+        _, kwargs = pipeline.load_lora_weights.call_args
+        assert kwargs["adapter_name"] == "lora_0_style_v1_0"
+        assert "." not in kwargs["adapter_name"]
+
+
+class TestSplitLoraKey:
+    def test_diffusers_peft_suffixes(self):
+        assert _split_lora_key("transformer.blocks.0.to_q.lora_A.weight") == (
+            "transformer.blocks.0.to_q",
+            "A",
+        )
+        assert _split_lora_key("transformer.blocks.0.to_q.lora_B.weight") == (
+            "transformer.blocks.0.to_q",
+            "B",
+        )
+
+    def test_kohya_suffixes(self):
+        assert _split_lora_key("lora_unet_blocks_0_to_q.lora_down.weight") == (
+            "lora_unet_blocks_0_to_q",
+            "A",
+        )
+        assert _split_lora_key("lora_unet_blocks_0_to_q.lora_up.weight") == (
+            "lora_unet_blocks_0_to_q",
+            "B",
+        )
+        assert _split_lora_key("lora_unet_blocks_0_to_q.alpha") == (
+            "lora_unet_blocks_0_to_q",
+            "alpha",
+        )
+
+    def test_unrecognized_returns_none(self):
+        assert _split_lora_key("some.random.weight") is None
+
+
+class TestNormalizeModulePath:
+    def test_diffusers_passthrough(self):
+        assert (
+            _normalize_module_path("transformer.blocks.0.attn.to_q", {})
+            == "transformer.blocks.0.attn.to_q"
+        )
+
+    def test_comfyui_prefix_remapped(self):
+        assert (
+            _normalize_module_path("diffusion_model.blocks.0.attn.to_q", {})
+            == "transformer.blocks.0.attn.to_q"
+        )
+
+    def test_kohya_flattened_resolved_via_model_map(self):
+        kohya_map = {"blocks_0_attn_to_q": "blocks.0.attn.to_q"}
+        assert (
+            _normalize_module_path("lora_unet_blocks_0_attn_to_q", kohya_map)
+            == "transformer.blocks.0.attn.to_q"
+        )
+
+    def test_kohya_flattened_unresolvable_returns_none(self):
+        assert _normalize_module_path("lora_unet_blocks_0_attn_to_q", {}) is None
+
+    def test_bare_module_path_gets_transformer_prefix(self):
+        assert (
+            _normalize_module_path("blocks.0.attn.to_q", {})
+            == "transformer.blocks.0.attn.to_q"
+        )
+
+
+class TestConvertLoraStateDict:
+    def test_comfyui_format_converted(self):
+        sd = {
+            "diffusion_model.blocks.0.to_q.lora_down.weight": _FakeTensor((4, 16)),
+            "diffusion_model.blocks.0.to_q.lora_up.weight": _FakeTensor((16, 4)),
+        }
+        converted, unmatched, te_skipped = _convert_lora_state_dict(sd, {})
+        assert set(converted) == {
+            "transformer.blocks.0.to_q.lora_A.weight",
+            "transformer.blocks.0.to_q.lora_B.weight",
+        }
+        assert unmatched == []
+        assert te_skipped == 0
+
+    def test_alpha_folded_into_lora_b(self):
+        """alpha/rank scaling is folded into the up (lora_B) tensor."""
+        sd = {
+            "diffusion_model.blocks.0.to_q.lora_down.weight": _FakeTensor((4, 16)),
+            "diffusion_model.blocks.0.to_q.lora_up.weight": _FakeTensor((16, 4), value=2.0),
+            "diffusion_model.blocks.0.to_q.alpha": _FakeTensor((), value=2.0),
+        }
+        converted, _, _ = _convert_lora_state_dict(sd, {})
+        lora_b = converted["transformer.blocks.0.to_q.lora_B.weight"]
+        # alpha=2.0, rank=4 -> scale 0.5; up value 2.0 * 0.5 = 1.0
+        assert lora_b.value == pytest.approx(1.0)
+        # No alpha keys leak into the converted dict
+        assert not any(k.endswith(".alpha") for k in converted)
+
+    def test_text_encoder_keys_skipped_not_unmatched(self):
+        sd = {
+            "lora_te_encoder_layers_0_q.lora_down.weight": _FakeTensor(),
+            "diffusion_model.blocks.0.to_q.lora_A.weight": _FakeTensor(),
+        }
+        converted, unmatched, te_skipped = _convert_lora_state_dict(sd, {})
+        assert te_skipped == 1
+        assert unmatched == []
+        assert len(converted) == 1
+
+    def test_foreign_keys_reported_unmatched(self):
+        sd = {"totally.unrelated.weight": _FakeTensor()}
+        converted, unmatched, _ = _convert_lora_state_dict(sd, {})
+        assert converted == {}
+        assert unmatched == ["totally.unrelated.weight"]
+
+
+class TestLoraFailureMessage:
+    def test_missing_peft_named_explicitly(self):
+        """The #1 field failure: diffusers raising for a missing peft install."""
+        exc = ValueError("PEFT backend is required for this method.")
+        msg = _lora_failure_message("style_anime", exc)
+        assert "peft" in msg.lower()
+        assert "style_anime" in msg
+        assert "install" in msg.lower()
+
+    def test_other_errors_surface_real_cause(self):
+        exc = OSError("No such file or directory")
+        msg = _lora_failure_message("missing", exc)
+        assert "missing" in msg
+        assert "OSError" in msg
+        assert "No such file or directory" in msg
