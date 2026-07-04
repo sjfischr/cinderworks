@@ -248,38 +248,124 @@ def _split_lora_key(key: str) -> tuple[str, str] | None:
     return None
 
 
-def _normalize_module_path(base: str, kohya_map: dict[str, str]) -> str | None:
+# Module renames between the original Krea 2 checkpoint layout (llama-style
+# names, what musubi-tuner and ComfyUI-ecosystem LoRAs are trained against)
+# and the diffusers port (Krea2Transformer2DModel):
+#
+#   original                        diffusers
+#   blocks.N                    ->  transformer_blocks.N
+#   blocks.N.attn.wq            ->  transformer_blocks.N.attn.to_q
+#   blocks.N.attn.wk            ->  transformer_blocks.N.attn.to_k
+#   blocks.N.attn.wv            ->  transformer_blocks.N.attn.to_v
+#   blocks.N.attn.wo            ->  transformer_blocks.N.attn.to_out.0
+#   blocks.N.attn.gate          ->  transformer_blocks.N.attn.to_gate
+#   blocks.N.mlp.{gate,up,down} ->  transformer_blocks.N.ff.{gate,up,down}
+#
+# The weights are identical 1:1 (QKV is not fused in the diffusers port),
+# so this is a pure rename — same trick diffusers' own non-diffusers
+# checkpoint converters apply for Flux/SDXL LoRAs.
+_ORIGINAL_ATTN_LEAF_RENAMES: dict[str, str] = {
+    "attn.wq": "attn.to_q",
+    "attn.wk": "attn.to_k",
+    "attn.wv": "attn.to_v",
+    "attn.wo": "attn.to_out.0",
+    "attn.gate": "attn.to_gate",
+}
+
+
+def _translate_original_layout(path: str) -> str:
+    """Translate an original-Krea-2-layout module path to diffusers names.
+
+    No-op for paths already in diffusers form: "transformer_blocks..."
+    does not start with the "blocks" segment, diffusers uses ".ff." not
+    ".mlp.", and the attention leaf names differ in every case.
+    """
+    segments = path.split(".")
+    if segments and segments[0] == "blocks":
+        segments[0] = "transformer_blocks"
+    out = ".".join(segments)
+    out = out.replace(".mlp.", ".ff.")
+    for old, new in _ORIGINAL_ATTN_LEAF_RENAMES.items():
+        if out.endswith("." + old) or out == old:
+            out = out[: -len(old)] + new
+            break
+    return out
+
+
+def _translate_original_layout_flat(flat: str) -> str:
+    """Same rename for kohya-flattened names ("blocks_0_attn_wq")."""
+    out = flat
+    if out.startswith("blocks_"):
+        out = "transformer_blocks_" + out[len("blocks_") :]
+    out = out.replace("_mlp_", "_ff_")
+    for old, new in _ORIGINAL_ATTN_LEAF_RENAMES.items():
+        old_flat = old.replace(".", "_")
+        if out.endswith("_" + old_flat):
+            out = out[: -len(old_flat)] + new.replace(".", "_")
+            break
+    return out
+
+
+def _normalize_module_path(
+    base: str,
+    kohya_map: dict[str, str],
+    real_modules: set[str] | None = None,
+) -> str | None:
     """Normalize a LoRA key's module path to diffusers 'transformer.*' form.
 
     Handles the dialects seen in the wild:
-    - diffusers-PEFT:  transformer.blocks.0.attn.to_q
-    - ComfyUI:         diffusion_model.blocks.0.attn.to_q
-    - kohya/musubi:    lora_unet_blocks_0_attn_to_q (flattened)
+    - diffusers-PEFT:   transformer.transformer_blocks.0.attn.to_q
+    - ComfyUI/musubi:   diffusion_model.blocks.0.attn.wq (original layout)
+    - kohya flattened:  lora_unet_blocks_0_attn_wq
+
+    Original-layout module names (wq/wk/wv/wo, attn.gate, mlp.*) are
+    translated to the diffusers port's names. When `real_modules` (the
+    live transformer's module paths) is provided, the final path is
+    validated against it — an unvalidated path handed to PEFT crashes
+    the whole load with "Target modules ... not found in the base
+    model", taking every other key down with it.
 
     Returns None when the path can't be resolved against the model.
     """
-    if base.startswith("transformer."):
-        return base
-    if base.startswith("diffusion_model."):
-        return "transformer." + base[len("diffusion_model.") :]
     for flat_prefix in ("lora_unet_", "lora_transformer_"):
         if base.startswith(flat_prefix):
-            real = kohya_map.get(base[len(flat_prefix) :])
+            flat = base[len(flat_prefix) :]
+            # kohya_map values come from the live model's named_modules,
+            # so they are real by construction — no translation/validation.
+            real = kohya_map.get(flat) or kohya_map.get(
+                _translate_original_layout_flat(flat)
+            )
             return f"transformer.{real}" if real else None
-    # Bare diffusers module path with no component prefix
-    if "." in base:
-        return "transformer." + base
-    return None
+
+    if base.startswith("transformer."):
+        rest = base[len("transformer.") :]
+    elif base.startswith("diffusion_model."):
+        rest = base[len("diffusion_model.") :]
+    elif "." in base:
+        # Bare module path with no component prefix
+        rest = base
+    else:
+        return None
+
+    rest = _translate_original_layout(rest)
+    if real_modules is not None and rest not in real_modules:
+        return None
+    return "transformer." + rest
 
 
 def _convert_lora_state_dict(
-    state_dict: dict[str, Any], kohya_map: dict[str, str]
+    state_dict: dict[str, Any],
+    kohya_map: dict[str, str],
+    real_modules: set[str] | None = None,
 ) -> tuple[dict[str, Any], list[str], int]:
     """Convert a LoRA state dict to diffusers-PEFT format (Forge Neo style).
 
     Renames lora_down/lora_up to lora_A/lora_B, remaps ComfyUI and
-    kohya-flattened module paths to 'transformer.*', and folds each
-    kohya 'alpha' into its lora_B tensor (delta_W = (alpha/rank)·up·down).
+    kohya-flattened module paths to 'transformer.*', translates
+    original-checkpoint module names (wq/wo/mlp.*) to the diffusers
+    port's names, and folds each kohya 'alpha' into its lora_B tensor
+    (delta_W = (alpha/rank)·up·down). When `real_modules` is provided,
+    every emitted module path is validated against the live model.
 
     Returns:
         (converted_dict, unmatched_keys, text_encoder_keys_skipped).
@@ -303,7 +389,7 @@ def _convert_lora_state_dict(
             # UNet/CLIP split where the CLIP half simply isn't loaded.
             te_skipped += 1
             continue
-        norm = _normalize_module_path(base, kohya_map)
+        norm = _normalize_module_path(base, kohya_map, real_modules)
         if norm is None:
             unmatched.append(key)
             continue
@@ -357,7 +443,13 @@ def _prepare_lora_source(file_path: Path, pipeline: Any) -> str | dict[str, Any]
         return str(file_path)
 
     kohya_map = _kohya_key_map(getattr(pipeline, "transformer", None))
-    converted, unmatched, te_skipped = _convert_lora_state_dict(state_dict, kohya_map)
+    # The live model's module paths, for validating every emitted key.
+    # PEFT hard-fails the entire load if even one target module doesn't
+    # exist, so anything unvalidated must be dropped, not passed through.
+    real_modules = set(kohya_map.values()) if kohya_map else None
+    converted, unmatched, te_skipped = _convert_lora_state_dict(
+        state_dict, kohya_map, real_modules
+    )
 
     if te_skipped:
         log.info(
