@@ -56,6 +56,8 @@ class Artifact:
     seed: int
     width: int | None
     height: int | None
+    artifact_type: str = "generated"
+    source_artifact_id: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -80,9 +82,23 @@ CREATE TABLE IF NOT EXISTS artifact (
     path          TEXT NOT NULL,
     seed          INTEGER NOT NULL,
     width         INTEGER,
-    height        INTEGER
+    height        INTEGER,
+    artifact_type TEXT NOT NULL DEFAULT 'generated',
+    source_artifact_id INTEGER REFERENCES artifact(id)
 );
 """
+
+# Migrations applied after schema creation to handle existing databases
+_MIGRATIONS = [
+    # M1: Add artifact_type and source_artifact_id columns for upscale tracking
+    (
+        "m1_artifact_type",
+        [
+            "ALTER TABLE artifact ADD COLUMN artifact_type TEXT NOT NULL DEFAULT 'generated'",
+            "ALTER TABLE artifact ADD COLUMN source_artifact_id INTEGER REFERENCES artifact(id)",
+        ],
+    ),
+]
 
 
 # ---------------------------------------------------------------------------
@@ -105,14 +121,33 @@ def _get_connection() -> sqlite3.Connection:
 
 
 def init_db() -> None:
-    """Create tables if they don't exist."""
+    """Create tables if they don't exist, then run any pending migrations."""
     Config.DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = _get_connection()
     try:
         conn.executescript(_SCHEMA_SQL)
         conn.commit()
+        _run_migrations(conn)
     finally:
         conn.close()
+
+
+def _run_migrations(conn: sqlite3.Connection) -> None:
+    """Apply pending migrations that haven't been run yet.
+
+    Migrations are idempotent — if a column already exists, the ALTER TABLE
+    is skipped gracefully.
+    """
+    for name, statements in _MIGRATIONS:
+        for sql in statements:
+            try:
+                conn.execute(sql)
+            except sqlite3.OperationalError as e:
+                # "duplicate column name" means migration already applied — skip
+                if "duplicate column" in str(e).lower():
+                    continue
+                raise
+    conn.commit()
 
 
 def create_job(
@@ -133,7 +168,9 @@ def create_job(
         model_id: Registry model id (e.g. 'krea2-turbo').
         duration_ms: Generation duration in milliseconds, or None if failed.
         status: 'complete' or 'failed'.
-        artifacts: List of dicts with keys: path, seed, width, height.
+        artifacts: List of dicts with keys: path, seed, width, height,
+                   and optionally artifact_type ('generated'|'upscaled')
+                   and source_artifact_id (int reference to parent artifact).
 
     Returns:
         The new job's integer id.
@@ -153,8 +190,8 @@ def create_job(
         for artifact in artifacts:
             conn.execute(
                 """
-                INSERT INTO artifact (job_id, path, seed, width, height)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO artifact (job_id, path, seed, width, height, artifact_type, source_artifact_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job_id,
@@ -162,6 +199,8 @@ def create_job(
                     artifact["seed"],
                     artifact.get("width"),
                     artifact.get("height"),
+                    artifact.get("artifact_type", "generated"),
+                    artifact.get("source_artifact_id"),
                 ),
             )
 
@@ -241,7 +280,7 @@ def get_job_artifacts(job_id: int) -> list[Artifact]:
     try:
         rows = conn.execute(
             """
-            SELECT id, job_id, path, seed, width, height
+            SELECT id, job_id, path, seed, width, height, artifact_type, source_artifact_id
             FROM artifact
             WHERE job_id = ?
             """,
@@ -256,9 +295,93 @@ def get_job_artifacts(job_id: int) -> list[Artifact]:
                 seed=row["seed"],
                 width=row["width"],
                 height=row["height"],
+                artifact_type=row["artifact_type"],
+                source_artifact_id=row["source_artifact_id"],
             )
             for row in rows
         ]
+    finally:
+        conn.close()
+
+
+def create_artifact(
+    job_id: int,
+    path: str,
+    seed: int,
+    width: int | None = None,
+    height: int | None = None,
+    artifact_type: str = "generated",
+    source_artifact_id: int | None = None,
+) -> int:
+    """Persist a single artifact linked to an existing job.
+
+    Used for adding upscaled images or other derived artifacts to a job
+    after initial creation.
+
+    Args:
+        job_id: The parent job's id.
+        path: File path to the artifact image.
+        seed: The seed used to produce this artifact.
+        width: Image width in pixels, or None.
+        height: Image height in pixels, or None.
+        artifact_type: 'generated' or 'upscaled'.
+        source_artifact_id: If this is a derived artifact (e.g. upscaled),
+                            the id of the source artifact it was created from.
+
+    Returns:
+        The new artifact's integer id.
+    """
+    conn = _get_connection()
+    try:
+        cursor = conn.execute(
+            """
+            INSERT INTO artifact (job_id, path, seed, width, height, artifact_type, source_artifact_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (job_id, path, seed, width, height, artifact_type, source_artifact_id),
+        )
+        conn.commit()
+        return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def find_artifact_by_path(path: str) -> Artifact | None:
+    """Find an artifact record by its file path.
+
+    Used to look up the source artifact when creating upscaled derivatives.
+
+    Args:
+        path: The file path stored in the artifact record.
+
+    Returns:
+        The matching Artifact, or None if not found.
+    """
+    conn = _get_connection()
+    try:
+        row = conn.execute(
+            """
+            SELECT id, job_id, path, seed, width, height, artifact_type, source_artifact_id
+            FROM artifact
+            WHERE path = ?
+            LIMIT 1
+            """,
+            (path,),
+        ).fetchone()
+
+        if row is None:
+            return None
+
+        return Artifact(
+            id=row["id"],
+            job_id=row["job_id"],
+            path=row["path"],
+            seed=row["seed"],
+            width=row["width"],
+            height=row["height"],
+            artifact_type=row["artifact_type"],
+            source_artifact_id=row["source_artifact_id"],
+        )
     finally:
         conn.close()
 

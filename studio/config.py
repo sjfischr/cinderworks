@@ -28,6 +28,7 @@ class Config:
     # Paths — all resolved via pathlib for platform-agnostic handling
     MODEL_DIR: Path = Path(os.getenv("MODEL_DIR", str(_STUDIO_ROOT / "models_store")))
     OUTPUT_DIR: Path = Path(os.getenv("OUTPUT_DIR", str(_STUDIO_ROOT / "outputs")))
+    LORAS_DIR: Path = Path(os.getenv("LORAS_DIR", str(_STUDIO_ROOT / "loras")))
     DB_PATH: Path = Path(os.getenv("DB_PATH", str(_STUDIO_ROOT / "studio.db")))
 
     # Convenience: the studio root itself
