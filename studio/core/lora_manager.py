@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import struct
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -189,12 +190,268 @@ def estimate_lora_stack_vram(stack: LoRAStack) -> int:
     return len(stack.entries) * _LORA_VRAM_ESTIMATE_BYTES
 
 
+# Adapter names become torch ModuleDict keys inside PEFT. ModuleDict
+# rejects names containing "." (and PEFT is picky beyond that), so a file
+# stem like "detail-tweaker-v1.5" would crash load_lora_weights on the
+# spot. Whitelist [0-9A-Za-z_]; the lora_{i}_ prefix keeps names unique
+# even when sanitization collides two stems.
+_ADAPTER_NAME_UNSAFE = re.compile(r"[^0-9A-Za-z_]")
+
+# Forge Neo aborts a LoRA when more than half its keys don't match the
+# model ("[LORA] LoRA mismatch"); below that it warns and loads the rest.
+_UNMATCHED_ABORT_RATIO = 0.5
+
+# Recognized per-tensor suffixes across LoRA dialects. kohya/musubi use
+# lora_down/lora_up (+ alpha); diffusers-PEFT uses lora_A/lora_B.
+_LORA_KEY_SUFFIXES: dict[str, str] = {
+    ".lora_A.weight": "A",
+    ".lora_B.weight": "B",
+    ".lora_down.weight": "A",
+    ".lora_up.weight": "B",
+    ".alpha": "alpha",
+}
+
+
+def _sanitize_adapter_name(raw: str) -> str:
+    """Make a string safe to use as a PEFT adapter name."""
+    return _ADAPTER_NAME_UNSAFE.sub("_", raw)
+
+
+def _kohya_key_map(transformer: Any) -> dict[str, str]:
+    """Map flattened kohya-style module names to real module paths.
+
+    kohya/musubi checkpoints flatten module paths by replacing "." with
+    "_" (e.g. "blocks.0.attn.to_q" -> "blocks_0_attn_to_q"), which cannot
+    be reversed by string rules alone ("to_q" keeps its underscore).
+    Forge and ComfyUI solve this by enumerating the actual model's module
+    names and matching against the flattened form — same approach here.
+
+    Returns an empty dict if the transformer can't be enumerated (tests
+    with mock pipelines, or no transformer attached).
+    """
+    try:
+        return {
+            name.replace(".", "_"): name
+            for name, _ in transformer.named_modules()
+            if name
+        }
+    except Exception:
+        return {}
+
+
+def _split_lora_key(key: str) -> tuple[str, str] | None:
+    """Split a state-dict key into (module path, part) where part is
+    'A', 'B', or 'alpha'. Returns None for unrecognized suffixes."""
+    for suffix, part in _LORA_KEY_SUFFIXES.items():
+        if key.endswith(suffix):
+            return key[: -len(suffix)], part
+    return None
+
+
+def _normalize_module_path(base: str, kohya_map: dict[str, str]) -> str | None:
+    """Normalize a LoRA key's module path to diffusers 'transformer.*' form.
+
+    Handles the dialects seen in the wild:
+    - diffusers-PEFT:  transformer.blocks.0.attn.to_q
+    - ComfyUI:         diffusion_model.blocks.0.attn.to_q
+    - kohya/musubi:    lora_unet_blocks_0_attn_to_q (flattened)
+
+    Returns None when the path can't be resolved against the model.
+    """
+    if base.startswith("transformer."):
+        return base
+    if base.startswith("diffusion_model."):
+        return "transformer." + base[len("diffusion_model.") :]
+    for flat_prefix in ("lora_unet_", "lora_transformer_"):
+        if base.startswith(flat_prefix):
+            real = kohya_map.get(base[len(flat_prefix) :])
+            return f"transformer.{real}" if real else None
+    # Bare diffusers module path with no component prefix
+    if "." in base:
+        return "transformer." + base
+    return None
+
+
+def _convert_lora_state_dict(
+    state_dict: dict[str, Any], kohya_map: dict[str, str]
+) -> tuple[dict[str, Any], list[str], int]:
+    """Convert a LoRA state dict to diffusers-PEFT format (Forge Neo style).
+
+    Renames lora_down/lora_up to lora_A/lora_B, remaps ComfyUI and
+    kohya-flattened module paths to 'transformer.*', and folds each
+    kohya 'alpha' into its lora_B tensor (delta_W = (alpha/rank)·up·down).
+
+    Returns:
+        (converted_dict, unmatched_keys, text_encoder_keys_skipped).
+        Unmatched keys are dropped, not fatal — the caller decides
+        whether the mismatch ratio warrants aborting.
+    """
+    tensors: dict[tuple[str, str], Any] = {}
+    alphas: dict[str, float] = {}
+    unmatched: list[str] = []
+    te_skipped = 0
+
+    for key, value in state_dict.items():
+        split = _split_lora_key(key)
+        if split is None:
+            unmatched.append(key)
+            continue
+        base, part = split
+        if base.startswith(("lora_te", "text_encoder.")):
+            # This app applies LoRAs to the transformer only; text-encoder
+            # weights (kohya lora_te_*) are skipped, matching Forge's
+            # UNet/CLIP split where the CLIP half simply isn't loaded.
+            te_skipped += 1
+            continue
+        norm = _normalize_module_path(base, kohya_map)
+        if norm is None:
+            unmatched.append(key)
+            continue
+        if part == "alpha":
+            try:
+                alphas[norm] = float(value)
+            except (TypeError, ValueError):
+                log.warning("Ignoring non-scalar alpha for '%s'", norm)
+        else:
+            tensors[(norm, part)] = value
+
+    converted: dict[str, Any] = {}
+    for (norm, part), tensor in tensors.items():
+        if part == "B" and norm in alphas:
+            # lora_up is (out_features, rank); scale by alpha/rank so the
+            # folded dict needs no separate alpha entries.
+            rank = tensor.shape[1] if getattr(tensor, "ndim", 2) >= 2 else tensor.shape[0]
+            if rank:
+                tensor = tensor * (alphas[norm] / rank)
+        converted[f"{norm}.lora_{part}.weight"] = tensor
+
+    return converted, unmatched, te_skipped
+
+
+def _prepare_lora_source(file_path: Path, pipeline: Any) -> str | dict[str, Any]:
+    """Pre-read and normalize a LoRA file for diffusers (best effort).
+
+    Follows the Forge Neo pattern: read the state dict ourselves, detect
+    the key dialect, remap to what the model expects, warn on small
+    mismatches, and abort only when most keys don't match. If the file
+    can't be pre-read (safetensors unavailable, or exotic formats), the
+    raw path is returned and diffusers' own loader gets to try.
+
+    Raises:
+        ValueError: If more than half the keys don't match the model —
+            the LoRA was almost certainly trained for a different base.
+    """
+    try:
+        from safetensors.torch import load_file
+    except ImportError:
+        return str(file_path)
+
+    try:
+        state_dict = load_file(str(file_path), device="cpu")
+    except Exception as e:
+        log.warning(
+            "Could not pre-read LoRA '%s' (%s) — passing path to diffusers directly",
+            file_path.name,
+            e,
+        )
+        return str(file_path)
+
+    kohya_map = _kohya_key_map(getattr(pipeline, "transformer", None))
+    converted, unmatched, te_skipped = _convert_lora_state_dict(state_dict, kohya_map)
+
+    if te_skipped:
+        log.info(
+            "LoRA '%s': skipped %d text-encoder key(s) (transformer-only application)",
+            file_path.name,
+            te_skipped,
+        )
+
+    considered = len(converted) + len(unmatched)
+    if considered == 0 or len(unmatched) > considered * _UNMATCHED_ABORT_RATIO:
+        raise ValueError(
+            f"LoRA key format mismatch: {len(unmatched)} of {considered} keys "
+            f"do not match the Krea 2 transformer (sample: "
+            f"{unmatched[:3] if unmatched else 'no LoRA keys found'}). "
+            f"This LoRA was likely trained for a different base model."
+        )
+    if unmatched:
+        log.warning(
+            "LoRA '%s': %d of %d keys unmatched — loading the remaining keys "
+            "(sample unmatched: %s)",
+            file_path.name,
+            len(unmatched),
+            considered,
+            unmatched[:3],
+        )
+
+    return converted
+
+
+def _cast_lora_layers_to_compute_dtype(pipeline: Any) -> None:
+    """Keep injected LoRA weights in bf16 when the base model is fp8.
+
+    Forge Neo forces "fp16 LoRA" whenever the base model is fp8/GGUF
+    quantized — LoRA math in a storage-only float8 dtype either crashes
+    (no fp8 matmul kernels) or destroys the adapter's precision. Our
+    fp8_scaled mode applies layerwise casting hooks to the transformer;
+    if PEFT initializes adapter weights from an fp8-stored base weight,
+    this puts them back in the bf16 compute dtype. Best-effort no-op
+    everywhere else (bf16 mode, mock pipelines, no torch).
+    """
+    try:
+        import torch
+
+        transformer = getattr(pipeline, "transformer", None)
+        if transformer is None:
+            return
+        fixed = 0
+        for name, param in transformer.named_parameters():
+            if "lora_" in name and param.dtype == torch.float8_e4m3fn:
+                param.data = param.data.to(torch.bfloat16)
+                fixed += 1
+        if fixed:
+            log.info(
+                "Cast %d LoRA weight tensor(s) from fp8 storage to bf16 "
+                "compute dtype (fp8 base model)",
+                fixed,
+            )
+    except Exception:
+        log.debug("LoRA dtype normalization skipped", exc_info=True)
+
+
+def _lora_failure_message(filename: str, exc: Exception) -> str:
+    """Build a plain-language error naming the LoRA and the real cause.
+
+    The original implementation reported every failure as "corrupted or
+    incompatible", which hid the actual (and common) cause — the peft
+    package missing entirely — behind a misleading message.
+    """
+    text = str(exc)
+    if "peft" in text.lower():
+        return (
+            f"Could not load LoRA '{filename}' — the 'peft' package is not "
+            f"installed. LoRA support requires it: run the bootstrap script "
+            f"again (or `uv pip install peft`) and restart the app."
+        )
+    return (
+        f"Could not load LoRA '{filename}' — {type(exc).__name__}: {text} "
+        f"(if this LoRA was trained for a different base model, it cannot "
+        f"be applied to Krea 2; remove it from the stack and try again)."
+    )
+
+
 def apply_loras(pipeline: Any, stack: LoRAStack, vram_manager: Any = None) -> None:
     """Apply LoRA stack to pipeline in order using diffusers load_lora_weights.
 
     Each LoRA is loaded fresh and applied with its configured weight.
     The function coordinates with the VRAM manager to pre-check that the
     combined footprint (base model + LoRAs) fits within the budget.
+
+    Loading emulates Forge Neo: the state dict is pre-read and its key
+    dialect (diffusers-PEFT, ComfyUI, kohya/musubi) normalized against
+    the actual model, small key mismatches are warned about rather than
+    fatal, failures name the real cause, and adapter weights are kept in
+    the bf16 compute dtype when the base model is fp8-quantized.
 
     This function is called AFTER the diffusion model tenant is acquired
     on GPU and BEFORE sampling begins (Requirement 8.1).
@@ -207,7 +464,8 @@ def apply_loras(pipeline: Any, stack: LoRAStack, vram_manager: Any = None) -> No
 
     Raises:
         RuntimeError: If VRAM budget is exceeded or any LoRA fails to load.
-            The error message identifies the specific LoRA that failed.
+            The error message identifies the specific LoRA that failed
+            and the underlying reason.
     """
     if not stack.entries:
         log.debug("Empty LoRA stack — nothing to apply")
@@ -247,18 +505,20 @@ def apply_loras(pipeline: Any, stack: LoRAStack, vram_manager: Any = None) -> No
     adapter_weights: list[float] = []
 
     for i, entry in enumerate(stack.entries):
-        adapter_name = f"lora_{i}_{entry.filename}"
+        adapter_name = _sanitize_adapter_name(f"lora_{i}_{entry.filename}")
         log.info(
-            "Loading LoRA %d/%d: '%s' (weight=%.2f)",
+            "Loading LoRA %d/%d: '%s' (weight=%.2f, adapter='%s')",
             i + 1,
             len(stack.entries),
             entry.filename,
             entry.weight,
+            adapter_name,
         )
 
         try:
+            source = _prepare_lora_source(entry.file_path, pipeline)
             pipeline.load_lora_weights(
-                str(entry.file_path),
+                source,
                 adapter_name=adapter_name,
             )
             adapter_names.append(adapter_name)
@@ -277,12 +537,8 @@ def apply_loras(pipeline: Any, stack: LoRAStack, vram_manager: Any = None) -> No
                 pass  # Don't mask the original error
 
             # Raise with plain-language message identifying the failed LoRA
-            # (Requirement 2.7)
-            raise RuntimeError(
-                f"Could not load LoRA '{entry.filename}' — "
-                f"the file may be corrupted or incompatible. "
-                f"Remove it from the stack and try again."
-            ) from e
+            # AND the underlying cause (Requirement 2.7)
+            raise RuntimeError(_lora_failure_message(entry.filename, e)) from e
 
     # Set all adapters active with their respective weights
     if adapter_names:
@@ -296,9 +552,12 @@ def apply_loras(pipeline: Any, stack: LoRAStack, vram_manager: Any = None) -> No
                 pass
             raise RuntimeError(
                 f"Could not apply LoRA weights — "
-                f"the combination may be incompatible. "
+                f"{type(e).__name__}: {e}. "
                 f"Try removing some LoRAs and regenerating."
             ) from e
+
+    # Forge Neo equivalent of "Automatic (fp16 LoRA)" for fp8 base models
+    _cast_lora_layers_to_compute_dtype(pipeline)
 
     log.info("All %d LoRA(s) applied successfully", len(stack.entries))
 
