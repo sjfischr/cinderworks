@@ -1071,6 +1071,27 @@ def _generate_real(
     vram_mgr.release(text_encoder_tenant)
     vram_mgr.acquire(dit_tenant)
 
+    # --- Apply LoRA stack (Requirements 2.4, 8.1) ---
+    # LoRAs are loaded AFTER the diffusion model tenant is acquired on GPU
+    # and BEFORE sampling begins. They are unloaded after sampling completes.
+    lora_stack_data = raw_params.get("lora_stack")
+    _applied_loras = False
+    if lora_stack_data:
+        from studio.core.lora_manager import LoRAEntry, LoRAStack, apply_loras
+
+        lora_entries = [
+            LoRAEntry(
+                file_path=Path(entry["path"]),
+                filename=Path(entry["path"]).stem,
+                weight=entry.get("weight", 1.0),
+            )
+            for entry in lora_stack_data
+        ]
+        lora_stack_obj = LoRAStack(entries=lora_entries)
+        yield "Applying LoRA stack..."
+        apply_loras(pipe, lora_stack_obj, vram_manager=vram_mgr)
+        _applied_loras = True
+
     if full_gpu_resident:
         # With the encoder detached, every module still attached to the
         # pipeline is CUDA-resident, so device resolution must be cuda.
@@ -1343,6 +1364,15 @@ def _generate_real(
         yield "Applying inpainting mask composite..."
         for img_path in all_images:
             apply_mask_composite(img_path, init_image_path, mask_path)
+
+    # --- Unload LoRAs (Requirements 2.6, 8.2) ---
+    # Unload LoRA weights before releasing the dit tenant, restoring the
+    # base model to a clean state for subsequent generations.
+    if _applied_loras:
+        from studio.core.lora_manager import unload_loras
+
+        unload_loras(pipe)
+        log.info("LoRA weights unloaded — base model restored")
 
     vram_mgr.release(dit_tenant)
 

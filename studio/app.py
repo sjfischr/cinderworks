@@ -311,7 +311,6 @@ def build_app() -> gr.Blocks:
                     selected_job_id = gr.Number(
                         label="Job ID to load",
                         precision=0,
-                        minimum=1,
                         info="Enter the Job ID from the table above, then click Load Parameters.",
                     )
                     load_params_btn = gr.Button(
